@@ -1,40 +1,37 @@
 package org.odyssey.playbackservice;
 
-import java.io.IOException;
 import java.lang.ref.WeakReference;
 import java.util.ArrayList;
 import java.util.Collections;
-import java.util.Iterator;
 import java.util.List;
 import java.util.Random;
-import java.util.Timer;
 import java.util.TimerTask;
-import java.util.concurrent.Semaphore;
 
-import org.odyssey.IOdysseyNowPlayingCallback;
 import org.odyssey.MainActivity;
 import org.odyssey.MusicLibraryHelper;
+import org.odyssey.MusicLibraryHelper.CoverBitmapGenerator;
 import org.odyssey.NowPlayingInformation;
 import org.odyssey.R;
 import org.odyssey.manager.DatabaseManager;
+import org.odyssey.playbackservice.GaplessPlayer.PlaybackException;
 
-import android.app.IntentService;
+import android.app.AlarmManager;
 import android.app.Notification;
 import android.app.NotificationManager;
 import android.app.PendingIntent;
 import android.app.Service;
 import android.content.BroadcastReceiver;
 import android.content.ComponentName;
+import android.content.ContentValues;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
-import android.content.SharedPreferences;
 import android.database.Cursor;
-import android.graphics.BitmapFactory;
 import android.graphics.drawable.BitmapDrawable;
 import android.media.AudioManager;
 import android.media.MediaMetadataRetriever;
 import android.media.RemoteControlClient;
+import android.net.Uri;
 import android.os.HandlerThread;
 import android.os.IBinder;
 import android.os.Message;
@@ -46,6 +43,7 @@ import android.os.RemoteException;
 import android.provider.MediaStore;
 import android.support.v4.app.NotificationCompat;
 import android.util.Log;
+import android.widget.RemoteViews;
 import android.widget.Toast;
 
 public class PlaybackService extends Service implements AudioManager.OnAudioFocusChangeListener {
@@ -57,6 +55,10 @@ public class PlaybackService extends Service implements AudioManager.OnAudioFocu
 
     public static enum REPEATSTATE {
         REPEAT_OFF, REPEAT_ALL, REPEAT_TRACK;
+    }
+
+    public static enum PLAYSTATE {
+        PLAYING, PAUSE, STOPPED;
     }
 
     public static final String TAG = "OdysseyPlaybackService";
@@ -75,6 +77,17 @@ public class PlaybackService extends Service implements AudioManager.OnAudioFocu
 
     public static final String INTENT_TRACKITEMNAME = "OdysseyTrackItem";
     public static final String INTENT_NOWPLAYINGNAME = "OdysseyNowPlaying";
+
+    // PendingIntent ids
+    private static final int NOTIFICATION_INTENT_PREVIOUS = 0;
+    private static final int NOTIFICATION_INTENT_PLAYPAUSE = 1;
+    private static final int NOTIFICATION_INTENT_NEXT = 2;
+    private static final int NOTIFICATION_INTENT_QUIT = 3;
+    private static final int NOTIFICATION_INTENT_OPENGUI = 4;
+
+    private static final int TIMEOUT_INTENT_QUIT = 5;
+
+    private final static int SERVICE_CANCEL_TIME = 60 * 5 * 1000;
 
     private HandlerThread mHandlerThread;
     private PlaybackServiceHandler mHandler;
@@ -101,23 +114,16 @@ public class PlaybackService extends Service implements AudioManager.OnAudioFocu
     private int mRepeat = 0;
 
     // Remote control
-    private RemoteController mRemoteControlClient = null;
-    private String mLastCoverURL = "";
+    private RemoteControlClient mRemoteControlClient = null;
 
     // Timer for service stop after certain amount of time
-    private Timer mServiceCancelTimer = null;
     private WakeLock mTempWakelock = null;
 
-    // NowPlaying callbacks
-    // List holding registered callback clients
-    private ArrayList<IOdysseyNowPlayingCallback> mNowPlayingCallbacks;
+    private MusicLibraryHelper.CoverBitmapGenerator mNotificationCoverGenerator;
+    private MusicLibraryHelper.CoverBitmapGenerator mLockscreenCoverGenerator;
 
     // Playlistmanager for saving and reading playlist
     private DatabaseManager mPlaylistManager = null;
-    
-    // Mutex for NowPlaying callbacks
-    private final Semaphore mCallbackMutex = new Semaphore(1, true);
-
 
     @Override
     public IBinder onBind(Intent intent) {
@@ -148,9 +154,9 @@ public class PlaybackService extends Service implements AudioManager.OnAudioFocu
         Log.v(TAG, "Service created");
 
         // Set listeners
-        mPlayer.setOnTrackStartListener(new PlaybackStartListener(this));
+        mPlayer.setOnTrackStartListener(new PlaybackStartListener());
         mPlayer.setOnTrackFinishedListener(new PlaybackFinishListener());
-        Process.setThreadPriority(Process.THREAD_PRIORITY_BACKGROUND);
+        // Process.setThreadPriority(Process.THREAD_PRIORITY_BACKGROUND);
 
         // set up playlistmanager
         mPlaylistManager = new DatabaseManager(getApplicationContext());
@@ -160,30 +166,36 @@ public class PlaybackService extends Service implements AudioManager.OnAudioFocu
 
         // mCurrentList = new ArrayList<TrackItem>();
         mCurrentPlayingIndex = (int) mPlaylistManager.getLastTrackNumber();
-        
-        if(mCurrentPlayingIndex < 0 || mCurrentPlayingIndex > mCurrentList.size()) {
-        	mCurrentPlayingIndex = -1;
+
+        // Retrieve repeat/random state from settings db
+        mRandom = mPlaylistManager.getLastRandomState();
+        mRepeat = mPlaylistManager.getLastRepeatState();
+
+        if (mCurrentPlayingIndex < 0 || mCurrentPlayingIndex > mCurrentList.size()) {
+            mCurrentPlayingIndex = -1;
         }
-        
+
         mLastPlayingIndex = -1;
         mNextPlayingIndex = -1;
-
-        // NowPlaying
-        mNowPlayingCallbacks = new ArrayList<IOdysseyNowPlayingCallback>();
 
         mNotificationBuilder = new NotificationCompat.Builder(this).setSmallIcon(R.drawable.ic_stat_odys).setContentTitle("Odyssey").setContentText("");
         mNotificationManager = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
 
-        IntentFilter intentFilter = new IntentFilter();
-        intentFilter.addAction(android.media.AudioManager.ACTION_AUDIO_BECOMING_NOISY);
-        intentFilter.addAction(ACTION_PREVIOUS);
-        intentFilter.addAction(ACTION_PAUSE);
-        intentFilter.addAction(ACTION_PLAY);
-        intentFilter.addAction(ACTION_TOGGLEPAUSE);
-        intentFilter.addAction(ACTION_NEXT);
-        intentFilter.addAction(ACTION_STOP);
+        if (mNoisyReceiver == null) {
+            mNoisyReceiver = new BroadcastControlReceiver();
 
-        registerReceiver(mNoisyReceiver, intentFilter);
+            IntentFilter intentFilter = new IntentFilter();
+            intentFilter.addAction(android.media.AudioManager.ACTION_AUDIO_BECOMING_NOISY);
+            intentFilter.addAction(ACTION_PREVIOUS);
+            intentFilter.addAction(ACTION_PAUSE);
+            intentFilter.addAction(ACTION_PLAY);
+            intentFilter.addAction(ACTION_TOGGLEPAUSE);
+            intentFilter.addAction(ACTION_NEXT);
+            intentFilter.addAction(ACTION_STOP);
+            intentFilter.addAction(ACTION_QUIT);
+
+            registerReceiver(mNoisyReceiver, intentFilter);
+        }
 
         // Remote control client
         ComponentName remoteReceiver = new ComponentName(getPackageName(), RemoteControlReceiver.class.getName());
@@ -195,7 +207,7 @@ public class PlaybackService extends Service implements AudioManager.OnAudioFocu
         PendingIntent buttonPendingIntent = PendingIntent.getBroadcast(this, 0, buttonIntent, 0);
 
         // Create remotecontrol instance
-        mRemoteControlClient = new RemoteController(buttonPendingIntent);
+        mRemoteControlClient = new RemoteControlClient(buttonPendingIntent);
         audioManager.registerRemoteControlClient(mRemoteControlClient);
 
         PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
@@ -204,11 +216,14 @@ public class PlaybackService extends Service implements AudioManager.OnAudioFocu
         // set up random generator
         mRandomGenerator = new Random();
 
+        mNotificationCoverGenerator = new CoverBitmapGenerator(this, new NotificationCoverListener());
+        mLockscreenCoverGenerator = new CoverBitmapGenerator(this, new LockscreenCoverListener());
     }
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
         super.onStartCommand(intent, flags, startId);
+        Log.v(TAG, "PBS onStartCommand");
         if (intent.getExtras() != null) {
             String action = intent.getExtras().getString("action");
             if (action != null) {
@@ -223,6 +238,8 @@ public class PlaybackService extends Service implements AudioManager.OnAudioFocu
                     stop();
                 } else if (action.equals(ACTION_PLAY)) {
                     resume();
+                } else if (action.equals(ACTION_QUIT)) {
+                    stopService();
                 }
             }
         }
@@ -233,6 +250,13 @@ public class PlaybackService extends Service implements AudioManager.OnAudioFocu
     @Override
     public void onDestroy() {
         Log.v(TAG, "Service destroyed");
+
+        cancelQuitAlert();
+
+        if (mNoisyReceiver != null) {
+            unregisterReceiver(mNoisyReceiver);
+            mNoisyReceiver = null;
+        }
         stopSelf();
 
     }
@@ -243,6 +267,14 @@ public class PlaybackService extends Service implements AudioManager.OnAudioFocu
         clearPlaylist();
         enqueueTrack(track);
         jumpToIndex(0, true);
+    }
+
+    public synchronized void cancelQuitAlert() {
+        Log.v(TAG, "Cancelling quit alert in alertmanager");
+        AlarmManager am = (AlarmManager) this.getSystemService(Context.ALARM_SERVICE);
+        Intent quitIntent = new Intent(ACTION_QUIT);
+        PendingIntent quitPI = PendingIntent.getBroadcast(this, TIMEOUT_INTENT_QUIT, quitIntent, PendingIntent.FLAG_UPDATE_CURRENT);
+        am.cancel(quitPI);
     }
 
     // Stops all playback
@@ -264,22 +296,25 @@ public class PlaybackService extends Service implements AudioManager.OnAudioFocu
 
         mPlayer.stop();
         mCurrentPlayingIndex = -1;
-        mLastCoverURL = "";
 
         mNextPlayingIndex = -1;
         mLastPlayingIndex = -1;
 
-        // Send empty NowPlaying
-        broadcastNowPlaying(new NowPlayingInformation(0, "", -1, mRepeat, mRandom));
+        updateStatus();
         stopService();
     }
 
     public void pause() {
+        Log.v(TAG, "PBS pause");
+
         if (mPlayer.isRunning()) {
             mLastPosition = mPlayer.getPosition();
             mPlayer.pause();
-            // Save position in settings table
-            mPlaylistManager.saveCurrentPlayState(mLastPosition, mCurrentPlayingIndex);
+
+            AlarmManager am = (AlarmManager) this.getSystemService(Context.ALARM_SERVICE);
+            Intent quitIntent = new Intent(ACTION_QUIT);
+            PendingIntent quitPI = PendingIntent.getBroadcast(this, TIMEOUT_INTENT_QUIT, quitIntent, PendingIntent.FLAG_UPDATE_CURRENT);
+            am.set(AlarmManager.RTC, System.currentTimeMillis() + SERVICE_CANCEL_TIME, quitPI);
 
             // Broadcast simple.last.fm.scrobble broadcast
             if (mCurrentPlayingIndex >= 0 && (mCurrentPlayingIndex < mCurrentList.size())) {
@@ -299,16 +334,13 @@ public class PlaybackService extends Service implements AudioManager.OnAudioFocu
             mIsPaused = true;
         }
 
-        if (mCurrentPlayingIndex >= 0 && (mCurrentPlayingIndex < mCurrentList.size())) {
-            broadcastNowPlaying(new NowPlayingInformation(0, mCurrentList.get(mCurrentPlayingIndex).getTrackURL(), mCurrentPlayingIndex, mRepeat, mRandom));
-            updateNotification();
-        }
-        mServiceCancelTimer = new Timer();
-        // Set timeout to 10 minutes for now
-        mServiceCancelTimer.schedule(new ServiceCancelTask(), (long) ((60 * 1000) * 10));
+        updateStatus();
+
     }
 
     public void resume() {
+        cancelQuitAlert();
+
         // Check if mediaplayer needs preparing
         long lastPosition = mPlaylistManager.getLastTrackPosition();
         if (!mPlayer.isPrepared() && (lastPosition != 0) && (mCurrentPlayingIndex != -1) && (mCurrentPlayingIndex < mCurrentList.size())) {
@@ -316,13 +348,14 @@ public class PlaybackService extends Service implements AudioManager.OnAudioFocu
             Log.v(TAG, "Resuming position before playback to: " + lastPosition);
             return;
         }
-    	
+
         if (mCurrentPlayingIndex < 0 && mCurrentList.size() > 0) {
             // Songs existing so start playback of playlist begin
             jumpToIndex(0, true);
         } else if (mCurrentPlayingIndex < 0 && mCurrentList.size() == 0) {
-            broadcastNowPlaying(new NowPlayingInformation(0, "", -1, mRepeat, mRandom));
-        } else if (mCurrentPlayingIndex < mCurrentList.size()){
+            updateStatus();
+        } else if (mCurrentPlayingIndex < mCurrentList.size()) {
+
             /*
              * Make sure service is "started" so android doesn't handle it as a
              * "bound service"
@@ -330,9 +363,13 @@ public class PlaybackService extends Service implements AudioManager.OnAudioFocu
             Intent serviceStartIntent = new Intent(this, PlaybackService.class);
             serviceStartIntent.addFlags(Intent.FLAG_FROM_BACKGROUND);
             startService(serviceStartIntent);
-            if (mServiceCancelTimer != null) {
-                mServiceCancelTimer.cancel();
-                mServiceCancelTimer = null;
+
+            // Request audio focus before doing anything
+            AudioManager audioManager = (AudioManager) getSystemService(Context.AUDIO_SERVICE);
+            int result = audioManager.requestAudioFocus(this, AudioManager.STREAM_MUSIC, AudioManager.AUDIOFOCUS_GAIN);
+            if (result != AudioManager.AUDIOFOCUS_REQUEST_GRANTED) {
+                // Abort command
+                return;
             }
             mPlayer.resume();
 
@@ -351,8 +388,8 @@ public class PlaybackService extends Service implements AudioManager.OnAudioFocu
 
             mIsPaused = false;
             mLastPosition = 0;
-            broadcastNowPlaying(new NowPlayingInformation(1, mCurrentList.get(mCurrentPlayingIndex).getTrackURL(), mCurrentPlayingIndex, mRepeat, mRandom));
-            updateNotification();
+
+            updateStatus();
         }
     }
 
@@ -365,7 +402,7 @@ public class PlaybackService extends Service implements AudioManager.OnAudioFocu
         }
     }
 
-    // add all tracks to playlist, shuffle and play
+    // add all tracks to playlist and play
     public void playAllTracks() {
 
         // clear playlist
@@ -413,8 +450,11 @@ public class PlaybackService extends Service implements AudioManager.OnAudioFocu
         }
 
         cursor.close();
+    }
 
-        // shuffle playlist
+    // add all tracks to playlist, shuffle and play
+    public void playAllTracksShuffled() {
+        playAllTracks();
         shufflePlaylist();
     }
 
@@ -436,32 +476,21 @@ public class PlaybackService extends Service implements AudioManager.OnAudioFocu
             // reset index
             mCurrentPlayingIndex = 0;
 
-            // sent broadcast
-            sendUpdateBroadcast();
-            updateNotification();
+            updateStatus();
 
             // set next track for gapless
+
             try {
                 mPlayer.setNextTrack(mCurrentList.get(mCurrentPlayingIndex + 1).getTrackURL());
-            } catch (IllegalArgumentException e) {
-                // TODO Auto-generated catch block
-                e.printStackTrace();
-            } catch (SecurityException e) {
-                // TODO Auto-generated catch block
-                e.printStackTrace();
-            } catch (IllegalStateException e) {
-                // TODO Auto-generated catch block
-                e.printStackTrace();
-            } catch (IOException e) {
-                // TODO Auto-generated catch block
-                e.printStackTrace();
+            } catch (PlaybackException e) {
+                handlePlaybackException(e);
             }
         } else if (mCurrentList.size() > 0 && index < 0) {
             // service stopped just shuffle playlist
             Collections.shuffle(mCurrentList);
 
             // sent broadcast
-            sendUpdateBroadcast();
+            updateStatus();
         }
     }
 
@@ -472,149 +501,8 @@ public class PlaybackService extends Service implements AudioManager.OnAudioFocu
         // Needs to set gaplessplayer next object and reorganize playlist
         // Keep device at least for 5 seconds turned on
         mTempWakelock.acquire(5000);
-        mPlayer.stop();
-        if (mRandom == RANDOMSTATE.RANDOM_ON.ordinal()) {
-
-            // save lastindex for previous
-            mLastPlayingIndex = mCurrentPlayingIndex;
-
-            // set currentindex to nextindex if exists
-
-            if (mNextPlayingIndex == -1) {
-                mCurrentPlayingIndex = mRandomGenerator.nextInt(mCurrentList.size());
-
-                // if current index dont change create a new random index
-                // but just trying 20 times
-                int counter = 0;
-                while (mLastPlayingIndex == mCurrentPlayingIndex && counter > 20) {
-                    mCurrentPlayingIndex = mRandomGenerator.nextInt(mCurrentList.size());
-                    counter++;
-                }
-            } else {
-                mCurrentPlayingIndex = mNextPlayingIndex;
-            }
-
-            // set new random nextindex
-            mNextPlayingIndex = mRandomGenerator.nextInt(mCurrentList.size());
-
-            // if next index equal to current index create a new random index
-            // but just trying 20 times
-            int counter = 0;
-            while (mNextPlayingIndex == mCurrentPlayingIndex && counter > 20) {
-                mNextPlayingIndex = mRandomGenerator.nextInt(mCurrentList.size());
-                counter++;
-            }
-
-            // Next track is availible
-            if (mCurrentPlayingIndex < mCurrentList.size() && (mCurrentPlayingIndex >= 0) ) {
-                try {
-                    mPlayer.play(mCurrentList.get(mCurrentPlayingIndex).getTrackURL());
-
-                    // Broadcast simple.last.fm.scrobble broadcast
-                    TrackItem item = mCurrentList.get(mCurrentPlayingIndex);
-                    Log.v(TAG, "Send to SLS: " + item);
-                    Intent bCast = new Intent("com.adam.aslfms.notify.playstatechanged");
-                    bCast.putExtra("state", 0);
-                    bCast.putExtra("app-name", "Odyssey");
-                    bCast.putExtra("app-package", "org.odyssey");
-                    bCast.putExtra("artist", item.getTrackArtist());
-                    bCast.putExtra("album", item.getTrackAlbum());
-                    bCast.putExtra("track", item.getTrackTitle());
-                    bCast.putExtra("duration", item.getTrackDuration() / 1000);
-                    sendBroadcast(bCast);
-
-                    // Check if next song is availible (gapless)
-                    if (mNextPlayingIndex < mCurrentList.size() && (mNextPlayingIndex >= 0)) {
-                        mPlayer.setNextTrack(mCurrentList.get(mNextPlayingIndex).getTrackURL());
-                    }
-
-                } catch (IllegalArgumentException e) {
-                    // In case of error stop playback and log error
-                    mPlayer.stop();
-                    Log.e(TAG, "IllegalArgument for playback");
-                    Toast.makeText(getBaseContext(), "Playback illegal argument  error", Toast.LENGTH_LONG).show();
-                } catch (SecurityException e) {
-                    // In case of error stop playback and log error
-                    mPlayer.stop();
-                    Log.e(TAG, "SecurityException for playback");
-                    Toast.makeText(getBaseContext(), "Playback security error", Toast.LENGTH_LONG).show();
-                } catch (IllegalStateException e) {
-                    // In case of error stop playback and log error
-                    mPlayer.stop();
-                    Log.e(TAG, "IllegalState for playback");
-                    Toast.makeText(getBaseContext(), "Playback state error", Toast.LENGTH_LONG).show();
-                } catch (IOException e) {
-                    // In case of error stop playback and log error
-                    mPlayer.stop();
-                    Log.e(TAG, "IOException for playback");
-                    Toast.makeText(getBaseContext(), "Playback IO error", Toast.LENGTH_LONG).show();
-                }
-            }
-
-        } else {
-
-            // save lastindex for previous in random mode
-            mLastPlayingIndex = mCurrentPlayingIndex;
-
-            if (mCurrentPlayingIndex + 1 < mCurrentList.size()) {
-                mCurrentPlayingIndex++;
-            } else if ((mCurrentPlayingIndex + 1) == mCurrentList.size()) {
-                if (mRepeat == REPEATSTATE.REPEAT_ALL.ordinal()) {
-                    // Last track so set index = 0 and repeat playlist
-                    mCurrentPlayingIndex = 0;
-                } else {
-                    // Last track just leave here
-                    stop();
-                    return;
-                }
-            }
-
-            // Next track is availible
-            if (mCurrentPlayingIndex < mCurrentList.size() && (mCurrentPlayingIndex >= 0)) {
-                // Start playback of new song
-                try {
-                    mPlayer.play(mCurrentList.get(mCurrentPlayingIndex).getTrackURL());
-
-                    // Broadcast simple.last.fm.scrobble broadcast
-                    TrackItem item = mCurrentList.get(mCurrentPlayingIndex);
-                    Log.v(TAG, "Send to SLS: " + item);
-                    Intent bCast = new Intent("com.adam.aslfms.notify.playstatechanged");
-                    bCast.putExtra("state", 0);
-                    bCast.putExtra("app-name", "Odyssey");
-                    bCast.putExtra("app-package", "org.odyssey");
-                    bCast.putExtra("artist", item.getTrackArtist());
-                    bCast.putExtra("album", item.getTrackAlbum());
-                    bCast.putExtra("track", item.getTrackTitle());
-                    bCast.putExtra("duration", item.getTrackDuration() / 1000);
-                    sendBroadcast(bCast);
-
-                    // Check if next song is availible (gapless)
-                    if (mCurrentPlayingIndex + 1 < mCurrentList.size()) {
-                        mPlayer.setNextTrack(mCurrentList.get(mCurrentPlayingIndex + 1).getTrackURL());
-                    }
-                } catch (IllegalArgumentException e) {
-                    // In case of error stop playback and log error
-                    mPlayer.stop();
-                    Log.e(TAG, "IllegalArgument for playback");
-                    Toast.makeText(getBaseContext(), "Playback illegal argument  error", Toast.LENGTH_LONG).show();
-                } catch (SecurityException e) {
-                    // In case of error stop playback and log error
-                    mPlayer.stop();
-                    Log.e(TAG, "SecurityException for playback");
-                    Toast.makeText(getBaseContext(), "Playback security error", Toast.LENGTH_LONG).show();
-                } catch (IllegalStateException e) {
-                    // In case of error stop playback and log error
-                    mPlayer.stop();
-                    Log.e(TAG, "IllegalState for playback");
-                    Toast.makeText(getBaseContext(), "Playback state error", Toast.LENGTH_LONG).show();
-                } catch (IOException e) {
-                    // In case of error stop playback and log error
-                    mPlayer.stop();
-                    Log.e(TAG, "IOException for playback");
-                    Toast.makeText(getBaseContext(), "Playback IO error", Toast.LENGTH_LONG).show();
-                }
-            }
-        }
+        mLastPlayingIndex = mCurrentPlayingIndex;
+        jumpToIndex(mNextPlayingIndex, true);
     }
 
     public void enqueueAsNextTrack(TrackItem track) {
@@ -623,30 +511,9 @@ public class PlaybackService extends Service implements AudioManager.OnAudioFocu
         if (mCurrentPlayingIndex >= 0) {
             // Enqueue in list structure
             mCurrentList.add(mCurrentPlayingIndex + 1, track);
+            mNextPlayingIndex = mCurrentPlayingIndex + 1;
             // Set next track to new one
-            try {
-                mPlayer.setNextTrack(mCurrentList.get(mCurrentPlayingIndex + 1).getTrackURL());
-            } catch (IllegalArgumentException e) {
-                // In case of error stop playback and log error
-                mPlayer.stop();
-                Log.e(TAG, "IllegalArgument for playback");
-                Toast.makeText(getBaseContext(), "Playback illegal argument  error", Toast.LENGTH_LONG).show();
-            } catch (SecurityException e) {
-                // In case of error stop playback and log error
-                mPlayer.stop();
-                Log.e(TAG, "SecurityException for playback");
-                Toast.makeText(getBaseContext(), "Playback security error", Toast.LENGTH_LONG).show();
-            } catch (IllegalStateException e) {
-                // In case of error stop playback and log error
-                mPlayer.stop();
-                Log.e(TAG, "IllegalState for playback");
-                Toast.makeText(getBaseContext(), "Playback state error", Toast.LENGTH_LONG).show();
-            } catch (IOException e) {
-                // In case of error stop playback and log error
-                mPlayer.stop();
-                Log.e(TAG, "IOException for playback");
-                Toast.makeText(getBaseContext(), "Playback IO error", Toast.LENGTH_LONG).show();
-            }
+            setNextTrackForMP();
         } else {
             // If not playing just add it to the beginning of the playlist
             mCurrentList.add(0, track);
@@ -666,128 +533,25 @@ public class PlaybackService extends Service implements AudioManager.OnAudioFocu
         // Keep device at least for 5 seconds turned on
         mTempWakelock.acquire(5000);
 
-        mPlayer.stop();
         if (mRandom == RANDOMSTATE.RANDOM_ON.ordinal()) {
 
             if (mLastPlayingIndex == -1) {
                 // if no lastindex reuse currentindex
-                mLastPlayingIndex = mCurrentPlayingIndex;
-
-            }
-
-            // use lastindex for currentindex
-            mCurrentPlayingIndex = mLastPlayingIndex;
-
-            // create new random nextindex
-            mNextPlayingIndex = mRandomGenerator.nextInt(mCurrentList.size());
-
-            // if next index equal to current index create a new random index
-            // but just trying 20 times
-            int counter = 0;
-            while (mNextPlayingIndex == mCurrentPlayingIndex && counter > 20) {
-                mNextPlayingIndex = mRandomGenerator.nextInt(mCurrentList.size());
-                counter++;
-            }
-
-            // Next track is availible
-            if (mCurrentPlayingIndex < mCurrentList.size() && mCurrentPlayingIndex >= 0) {
-                try {
-                    mPlayer.play(mCurrentList.get(mCurrentPlayingIndex).getTrackURL());
-
-                    // Broadcast simple.last.fm.scrobble broadcast
-                    TrackItem item = mCurrentList.get(mCurrentPlayingIndex);
-                    Log.v(TAG, "Send to SLS: " + item);
-                    Intent bCast = new Intent("com.adam.aslfms.notify.playstatechanged");
-                    bCast.putExtra("state", 0);
-                    bCast.putExtra("app-name", "Odyssey");
-                    bCast.putExtra("app-package", "org.odyssey");
-                    bCast.putExtra("artist", item.getTrackArtist());
-                    bCast.putExtra("album", item.getTrackAlbum());
-                    bCast.putExtra("track", item.getTrackTitle());
-                    bCast.putExtra("duration", item.getTrackDuration() / 1000);
-                    sendBroadcast(bCast);
-
-                    // Check if next song is availible (gapless)
-                    if (mNextPlayingIndex < mCurrentList.size() && (mNextPlayingIndex >= 0)) {
-                        mPlayer.setNextTrack(mCurrentList.get(mNextPlayingIndex).getTrackURL());
-                    }
-
-                } catch (IllegalArgumentException e) {
-                    // In case of error stop playback and log error
-                    mPlayer.stop();
-                    Log.e(TAG, "IllegalArgument for playback");
-                    Toast.makeText(getBaseContext(), "Playback illegal argument  error", Toast.LENGTH_LONG).show();
-                } catch (SecurityException e) {
-                    // In case of error stop playback and log error
-                    mPlayer.stop();
-                    Log.e(TAG, "SecurityException for playback");
-                    Toast.makeText(getBaseContext(), "Playback security error", Toast.LENGTH_LONG).show();
-                } catch (IllegalStateException e) {
-                    // In case of error stop playback and log error
-                    mPlayer.stop();
-                    Log.e(TAG, "IllegalState for playback");
-                    Toast.makeText(getBaseContext(), "Playback state error", Toast.LENGTH_LONG).show();
-                } catch (IOException e) {
-                    // In case of error stop playback and log error
-                    mPlayer.stop();
-                    Log.e(TAG, "IOException for playback");
-                    Toast.makeText(getBaseContext(), "Playback IO error", Toast.LENGTH_LONG).show();
-                }
+                jumpToIndex(mCurrentPlayingIndex, true);
+            } else if (mLastPlayingIndex >= 0 && mLastPlayingIndex < mCurrentList.size()) {
+                Log.v(TAG, "Found old track index");
+                jumpToIndex(mLastPlayingIndex, true);
             }
 
         } else {
-
-            if (mCurrentPlayingIndex - 1 >= 0) {
-                mCurrentPlayingIndex--;
+            // Check if start is reached
+            if ((mCurrentPlayingIndex - 1 >= 0) && mCurrentPlayingIndex < mCurrentList.size() && mCurrentPlayingIndex >= 0) {
+                jumpToIndex(mCurrentPlayingIndex - 1, true);
             } else if (mRepeat == REPEATSTATE.REPEAT_ALL.ordinal()) {
                 // In repeat mode next track is last track of playlist
-                mCurrentPlayingIndex = mCurrentList.size() - 1;
-            }
-
-            // Next track is availible
-            if (mCurrentPlayingIndex < mCurrentList.size() && mCurrentPlayingIndex >= 0) {
-                // Start playback of new song
-                try {
-                    mPlayer.play(mCurrentList.get(mCurrentPlayingIndex).getTrackURL());
-
-                    // Broadcast simple.last.fm.scrobble broadcast
-                    TrackItem item = mCurrentList.get(mCurrentPlayingIndex);
-                    Log.v(TAG, "Send to SLS: " + item);
-                    Intent bCast = new Intent("com.adam.aslfms.notify.playstatechanged");
-                    bCast.putExtra("state", 0);
-                    bCast.putExtra("app-name", "Odyssey");
-                    bCast.putExtra("app-package", "org.odyssey");
-                    bCast.putExtra("artist", item.getTrackArtist());
-                    bCast.putExtra("album", item.getTrackAlbum());
-                    bCast.putExtra("track", item.getTrackTitle());
-                    bCast.putExtra("duration", item.getTrackDuration() / 1000);
-                    sendBroadcast(bCast);
-
-                    // Check if next song is availible (gapless)
-                    if (mCurrentPlayingIndex + 1 < mCurrentList.size()) {
-                        mPlayer.setNextTrack(mCurrentList.get(mCurrentPlayingIndex + 1).getTrackURL());
-                    }
-                } catch (IllegalArgumentException e) {
-                    // In case of error stop playback and log error
-                    mPlayer.stop();
-                    Log.e(TAG, "IllegalArgument for playback");
-                    Toast.makeText(getBaseContext(), "Playback illegal argument  error", Toast.LENGTH_LONG).show();
-                } catch (SecurityException e) {
-                    // In case of error stop playback and log error
-                    mPlayer.stop();
-                    Log.e(TAG, "SecurityException for playback");
-                    Toast.makeText(getBaseContext(), "Playback security error", Toast.LENGTH_LONG).show();
-                } catch (IllegalStateException e) {
-                    // In case of error stop playback and log error
-                    mPlayer.stop();
-                    Log.e(TAG, "IllegalState for playback");
-                    Toast.makeText(getBaseContext(), "Playback state error", Toast.LENGTH_LONG).show();
-                } catch (IOException e) {
-                    // In case of error stop playback and log error
-                    mPlayer.stop();
-                    Log.e(TAG, "IOException for playback");
-                    Toast.makeText(getBaseContext(), "Playback IO error", Toast.LENGTH_LONG).show();
-                }
+                jumpToIndex(mCurrentList.size() - 1, true);
+            } else {
+                stop();
             }
         }
     }
@@ -812,12 +576,10 @@ public class PlaybackService extends Service implements AudioManager.OnAudioFocu
     }
 
     public void clearPlaylist() {
+        // Clear the list
+        mCurrentList.clear();
         // Stop the playback
         stop();
-        // Clear the list and reset index
-        mCurrentList.clear();
-        mCurrentPlayingIndex = -1;
-        // TODO notify connected listeners
     }
 
     public void jumpToIndex(int index, boolean startPlayback) {
@@ -827,84 +589,52 @@ public class PlaybackService extends Service implements AudioManager.OnAudioFocu
     public void jumpToIndex(int index, boolean startPlayback, int jumpTime) {
         Log.v(TAG, "Playback of index: " + index + " requested");
         Log.v(TAG, "Playlist size: " + mCurrentList.size());
+
+        if (mPlayer.getActive()) {
+            Log.v(TAG, "Ignoring command because gapless player is active");
+            return;
+        }
+
+        cancelQuitAlert();
+
         // Stop playback
         mPlayer.stop();
         // Set currentindex to new song
         if (index < mCurrentList.size() && index >= 0) {
             mCurrentPlayingIndex = index;
-            try {
-                Log.v(TAG, "Start playback of: " + mCurrentList.get(mCurrentPlayingIndex));
+            Log.v(TAG, "Start playback of: " + mCurrentList.get(mCurrentPlayingIndex));
 
-                // Broadcast simple.last.fm.scrobble broadcast
-                TrackItem item = mCurrentList.get(mCurrentPlayingIndex);
-                if (startPlayback) {
+            /*
+             * Make sure service is "started" so android doesn't handle it as a
+             * "bound service"
+             */
+            Intent serviceStartIntent = new Intent(this, PlaybackService.class);
+            serviceStartIntent.addFlags(Intent.FLAG_FROM_BACKGROUND);
+            startService(serviceStartIntent);
 
-                    // Request audio focus before doing anything
-                    AudioManager audioManager = (AudioManager) getSystemService(Context.AUDIO_SERVICE);
-                    int result = audioManager.requestAudioFocus(this, AudioManager.STREAM_MUSIC, AudioManager.AUDIOFOCUS_GAIN);
-                    if (result != AudioManager.AUDIOFOCUS_REQUEST_GRANTED) {
-                        // Abort command
-                        return;
-                    }
-                    /*
-                     * Make sure service is "started" so android doesn't handle
-                     * it as a "bound service"
-                     */
-                    Intent serviceStartIntent = new Intent(this, PlaybackService.class);
-                    serviceStartIntent.addFlags(Intent.FLAG_FROM_BACKGROUND);
-                    startService(serviceStartIntent);
-                    if (mServiceCancelTimer != null) {
-                        mServiceCancelTimer.cancel();
-                        mServiceCancelTimer = null;
-                    }
-                    mIsPaused = false;
-
-                    mPlayer.play(mCurrentList.get(mCurrentPlayingIndex).getTrackURL());
-                    Log.v(TAG, "Send to SLS: " + item);
-                    Intent bCast = new Intent("com.adam.aslfms.notify.playstatechanged");
-                    bCast.putExtra("state", 0);
-                    bCast.putExtra("app-name", "Odyssey");
-                    bCast.putExtra("app-package", "org.odyssey");
-                    bCast.putExtra("artist", item.getTrackArtist());
-                    bCast.putExtra("album", item.getTrackAlbum());
-                    bCast.putExtra("track", item.getTrackTitle());
-                    bCast.putExtra("duration", item.getTrackDuration() / 1000);
-                    sendBroadcast(bCast);
-                    broadcastNowPlaying(new NowPlayingInformation(1, mCurrentList.get(mCurrentPlayingIndex).getTrackURL(), mCurrentPlayingIndex, mRepeat, mRandom));
-                } else {
-                    mPlayer.play(mCurrentList.get(mCurrentPlayingIndex).getTrackURL(), jumpTime);
-                    // broadcastNowPlaying(new NowPlayingInformation(0,
-                    // mCurrentList.get(mCurrentPlayingIndex).getTrackURL(),
-                    // mCurrentPlayingIndex, mRepeat, mRandom));
-                }
-
-                // Check if another song follows current one for gapless
-                // playback
-                if ((mCurrentPlayingIndex + 1) < mCurrentList.size()) {
-                    Log.v(TAG, "Set next track to: " + mCurrentList.get(mCurrentPlayingIndex + 1));
-                    mPlayer.setNextTrack(mCurrentList.get(mCurrentPlayingIndex + 1).getTrackURL());
-                }
-            } catch (IllegalArgumentException e) {
-                // In case of error stop playback and log error
-                mPlayer.stop();
-                Log.e(TAG, "IllegalArgument for playback");
-                Toast.makeText(getBaseContext(), "Playback illegal argument  error", Toast.LENGTH_LONG).show();
-            } catch (SecurityException e) {
-                // In case of error stop playback and log error
-                mPlayer.stop();
-                Log.e(TAG, "SecurityException for playback");
-                Toast.makeText(getBaseContext(), "Playback security error", Toast.LENGTH_LONG).show();
-            } catch (IllegalStateException e) {
-                // In case of error stop playback and log error
-                mPlayer.stop();
-                Log.e(TAG, "IllegalState for playback");
-                Toast.makeText(getBaseContext(), "Playback state error", Toast.LENGTH_LONG).show();
-            } catch (IOException e) {
-                // In case of error stop playback and log error
-                mPlayer.stop();
-                Log.e(TAG, "IOException for playback");
-                Toast.makeText(getBaseContext(), "Playback IO error", Toast.LENGTH_LONG).show();
+            TrackItem item = mCurrentList.get(mCurrentPlayingIndex);
+            // Request audio focus before doing anything
+            AudioManager audioManager = (AudioManager) getSystemService(Context.AUDIO_SERVICE);
+            int result = audioManager.requestAudioFocus(this, AudioManager.STREAM_MUSIC, AudioManager.AUDIOFOCUS_GAIN);
+            if (result != AudioManager.AUDIOFOCUS_REQUEST_GRANTED) {
+                // Abort command
+                return;
             }
+
+            mIsPaused = false;
+
+            try {
+                mPlayer.play(item.getTrackURL(), jumpTime);
+            } catch (PlaybackException e) {
+                handlePlaybackException(e);
+            }
+
+            // Check if another song follows current one for gapless
+            // playback
+            mNextPlayingIndex = index;
+
+        } else if (index == -1) {
+            stop();
         }
 
     }
@@ -920,6 +650,14 @@ public class PlaybackService extends Service implements AudioManager.OnAudioFocu
             return mPlayer.getPosition();
         } else {
             return mLastPosition;
+        }
+    }
+
+    public int getTrackDuration() {
+        if (mPlayer.isPrepared() || mPlayer.isRunning()) {
+            return mPlayer.getDuration();
+        } else {
+            return 0;
         }
     }
 
@@ -941,41 +679,9 @@ public class PlaybackService extends Service implements AudioManager.OnAudioFocu
          */
         if (mCurrentPlayingIndex == (oldSize - 1) && (mCurrentPlayingIndex >= 0)) {
             // Next song for MP has to be set for gapless mediaplayback
-            try {
-                mPlayer.setNextTrack(mCurrentList.get(mCurrentPlayingIndex + 1).getTrackURL());
-            } catch (IllegalArgumentException e) {
-                // In case of error stop playback and log error
-                mPlayer.stop();
-                Log.e(TAG, "IllegalArgument for playback");
-                Toast.makeText(getBaseContext(), "Playback illegal argument  error", Toast.LENGTH_LONG).show();
-            } catch (SecurityException e) {
-                // In case of error stop playback and log error
-                mPlayer.stop();
-                Log.e(TAG, "SecurityException for playback");
-                Toast.makeText(getBaseContext(), "Playback security error", Toast.LENGTH_LONG).show();
-            } catch (IllegalStateException e) {
-                // In case of error stop playback and log error
-                mPlayer.stop();
-                Log.e(TAG, "IllegalState for playback");
-                Toast.makeText(getBaseContext(), "Playback state error", Toast.LENGTH_LONG).show();
-            } catch (IOException e) {
-                // In case of error stop playback and log error
-                mPlayer.stop();
-                Log.e(TAG, "IOException for playback");
-                Toast.makeText(getBaseContext(), "Playback IO error", Toast.LENGTH_LONG).show();
-            }
+            mNextPlayingIndex = mCurrentPlayingIndex + 1;
+            setNextTrackForMP();
         }
-    }
-
-    public void dequeueTracks(ArrayList<String> tracklist) {
-        for (String track : tracklist) {
-            dequeueTrack(track);
-        }
-    }
-
-    public void dequeueTrack(String track) {
-        // Check if track is currently playing, if so stop it
-        mCurrentList.remove(track);
     }
 
     public void dequeueTrack(int index) {
@@ -992,29 +698,7 @@ public class PlaybackService extends Service implements AudioManager.OnAudioFocu
             // Deletion of next song which requires extra handling
             // because of gapless playback, set next song to next on
             mCurrentList.remove(index);
-            try {
-                mPlayer.setNextTrack(mCurrentList.get(index).getTrackURL());
-            } catch (IllegalArgumentException e) {
-                // In case of error stop playback and log error
-                mPlayer.stop();
-                Log.e(TAG, "IllegalArgument for playback");
-                Toast.makeText(getBaseContext(), "Playback illegal argument  error", Toast.LENGTH_LONG).show();
-            } catch (SecurityException e) {
-                // In case of error stop playback and log error
-                mPlayer.stop();
-                Log.e(TAG, "SecurityException for playback");
-                Toast.makeText(getBaseContext(), "Playback security error", Toast.LENGTH_LONG).show();
-            } catch (IllegalStateException e) {
-                // In case of error stop playback and log error
-                mPlayer.stop();
-                Log.e(TAG, "IllegalState for playback");
-                Toast.makeText(getBaseContext(), "Playback state error", Toast.LENGTH_LONG).show();
-            } catch (IOException e) {
-                // In case of error stop playback and log error
-                mPlayer.stop();
-                Log.e(TAG, "IOException for playback");
-                Toast.makeText(getBaseContext(), "Playback IO error", Toast.LENGTH_LONG).show();
-            }
+            setNextTrackForMP();
         } else if (index >= 0 && index < mCurrentList.size()) {
             mCurrentList.remove(index);
             // mCurrentIndex is now moved one position up so set variable
@@ -1023,7 +707,8 @@ public class PlaybackService extends Service implements AudioManager.OnAudioFocu
             }
         }
         // Send new NowPlaying because playlist changed
-        sendUpdateBroadcast();
+        // sendUpdateBroadcast();
+        updateStatus();
     }
 
     /**
@@ -1031,14 +716,41 @@ public class PlaybackService extends Service implements AudioManager.OnAudioFocu
      * any ongoing notification.
      */
     public void stopService() {
+        Log.v(TAG, "Stopping service");
+
+        // Cancel possible cancel timers ( yeah, very funny )
+        cancelQuitAlert();
+
+        mLastPosition = getTrackPosition();
+
+        // If it is still running stop playback.
+        if (mPlayer.isRunning() || mPlayer.isPrepared()) {
+            mPlayer.stop();
+        }
+        Log.v(TAG, "Stopping service and saving playlist with size: " + mCurrentList.size() + " and currentplaying: " + mCurrentPlayingIndex + " at position: " + mLastPosition);
         // save currentlist to database
         mPlaylistManager.savePlaylist(mCurrentList);
-        // TODO save current track and track position
 
-        mPlayer.stop();
+        // Save position in settings table
+        mPlaylistManager.saveCurrentPlayState(mLastPosition, mCurrentPlayingIndex, mRandom, mRepeat);
+
+        // Get the actual trackitem and distribute the information
+        if ((mCurrentList != null) && (mCurrentPlayingIndex >= 0) && (mCurrentPlayingIndex < mCurrentList.size())) {
+            TrackItem trackItem = mCurrentList.get(mCurrentPlayingIndex);
+            setLockscreenPicture(trackItem, PLAYSTATE.STOPPED);
+            clearNotification();
+            // notifyNowPlayingListeners(trackItem, PLAYSTATE.PLAYING);
+            broadcastPlaybackInformation(trackItem, PLAYSTATE.STOPPED);
+        } else {
+            updateStatus();
+        }
+
+        // Removes foreground notification (probably already done)
         stopForeground(true);
         mNotificationBuilder.setOngoing(false);
         mNotificationManager.cancel(NOTIFICATION_ID);
+
+        // Stops the service itself.
         stopSelf();
     }
 
@@ -1050,162 +762,59 @@ public class PlaybackService extends Service implements AudioManager.OnAudioFocu
         return mRepeat;
     }
 
+    /*
+     * Enables/disables repeat function. If enabling check if end of playlist is
+     * already reached and then set next track to track0.
+     * 
+     * If disabling check if last track plays.
+     */
     public void setRepeat(int repeat) {
-        // TODO SET LOOPING FOR MP
         mRepeat = repeat;
-    }
-
-    public void setRandom(int random) {
-        // TODO set next mp to random one,too
-        mRandom = random;
-    }
-
-    /**
-     * Registers callback interfaces from distant processes which receive the
-     * NowPlayingInformation
-     * 
-     * @param callback
-     */
-    public synchronized void registerNowPlayingCallback(IOdysseyNowPlayingCallback callback) {
-        Log.v(TAG, "Added NowPlaying callback");
-        // mutex lock
-        try {
-			mCallbackMutex.acquire();
-		} catch (InterruptedException e1) {
-			// TODO Auto-generated catch block
-			e1.printStackTrace();
-		}
-        mNowPlayingCallbacks.add(callback);
-        // mutex unlock
-        mCallbackMutex.release();
-        // Notify about current status right away
-        if (mCurrentList.size() > 0 && mCurrentPlayingIndex >= 0 && (mCurrentPlayingIndex < mCurrentList.size())) {
-            String playingURL = mCurrentList.get(mCurrentPlayingIndex).getTrackURL();
-            int playing = mPlayer.isRunning() ? 1 : 0;
-            try {
-                callback.receiveNewNowPlayingInformation(new NowPlayingInformation(playing, playingURL, mCurrentPlayingIndex, mRepeat, mRandom));
-            } catch (RemoteException e) {
-                // TODO Auto-generated catch block
-                e.printStackTrace();
+        updateStatus(false, false, true);
+        if (mRepeat == REPEATSTATE.REPEAT_ALL.ordinal()) {
+            // If playing last track, next must be first in playlist
+            if (mCurrentPlayingIndex == mCurrentList.size() - 1) {
+                mNextPlayingIndex = 0;
+                setNextTrackForMP();
             }
-        }
-    }
-
-    /**
-     * Unregister callback interfaces from distant processes
-     * 
-     * @param callback
-     */
-    public synchronized void unregisterNowPlayingCallback(IOdysseyNowPlayingCallback callback) {
-        Log.v(TAG, "Unregistering callback");
-        // mutex lock
-        try {
-			mCallbackMutex.acquire();
-		} catch (InterruptedException e) {
-			// TODO Auto-generated catch block
-			e.printStackTrace();
-		}
-        mNowPlayingCallbacks.remove(callback);
-        // mutex unlock
-        mCallbackMutex.release();
-    }
-
-    private synchronized void broadcastNowPlaying(NowPlayingInformation info) {
-        /*
-         * Sends a new NowPlaying object on its way to connected callbacks
-         * PlaybackService --> OdysseyApplication |-> Homescreen-widget
-         */
-    	// mutex lock
-    	try {
-			mCallbackMutex.acquire();
-		} catch (InterruptedException e1) {
-			// TODO Auto-generated catch block
-			e1.printStackTrace();
-		}
-        for (IOdysseyNowPlayingCallback callback : mNowPlayingCallbacks) {
-            Log.v(TAG, "Sending now playing information to receiver");
-            try {
-                callback.receiveNewNowPlayingInformation(info);
-            } catch (RemoteException e) {
-                e.printStackTrace();
-            }
-        }
-        // mutex unlock
-        mCallbackMutex.release();
-
-        if (mCurrentPlayingIndex >= 0 && (mCurrentPlayingIndex < mCurrentList.size())) {
-            Intent broadcastIntent = new Intent(MESSAGE_NEWTRACKINFORMATION);
-            ArrayList<Parcelable> extraTrackItemList = new ArrayList<Parcelable>();
-            extraTrackItemList.add(mCurrentList.get(mCurrentPlayingIndex));
-            ArrayList<Parcelable> extraNPList = new ArrayList<Parcelable>();
-            extraNPList.add(info);
-            broadcastIntent.putParcelableArrayListExtra(INTENT_TRACKITEMNAME, extraTrackItemList);
-            broadcastIntent.putParcelableArrayListExtra(INTENT_NOWPLAYINGNAME, extraNPList);
-            sendBroadcast(broadcastIntent);
-
-            String where = android.provider.MediaStore.Audio.Albums.ALBUM_KEY + "=?";
-
-            String whereVal[] = { mCurrentList.get(mCurrentPlayingIndex).getTrackAlbumKey() };
-
-            Cursor cursor = getContentResolver().query(MediaStore.Audio.Albums.EXTERNAL_CONTENT_URI, new String[] { MediaStore.Audio.Albums.ALBUM_ART }, where, whereVal, "");
-
-            String coverPath = null;
-            if (cursor.moveToFirst()) {
-                coverPath = cursor.getString(cursor.getColumnIndex(MediaStore.Audio.Albums.ALBUM_ART));
-            }
-
-            cursor.close();
-
-            BitmapDrawable cover;
-
-            RemoteControlClient.MetadataEditor editor = mRemoteControlClient.editMetadata(false);
-
-            if (coverPath != null) {
-                if (coverPath != mLastCoverURL) {
-                    mLastCoverURL = coverPath;
-                    cover = (BitmapDrawable) BitmapDrawable.createFromPath(mLastCoverURL);
-                    editor.putBitmap(RemoteControlClient.MetadataEditor.BITMAP_KEY_ARTWORK, cover.getBitmap());
-                }
-
-            } else {
-                editor.putBitmap(RemoteControlClient.MetadataEditor.BITMAP_KEY_ARTWORK, null);
-            }
-
-            // Set remote control
-            TrackItem item = mCurrentList.get(mCurrentPlayingIndex);
-
-            editor.putString(MediaMetadataRetriever.METADATA_KEY_ALBUM, item.getTrackAlbum());
-            editor.putString(MediaMetadataRetriever.METADATA_KEY_ARTIST, item.getTrackArtist());
-            editor.putString(MediaMetadataRetriever.METADATA_KEY_ALBUMARTIST, item.getTrackArtist());
-            editor.putString(MediaMetadataRetriever.METADATA_KEY_TITLE, item.getTrackTitle());
-            editor.apply();
-            if (mPlayer.isRunning()) {
-                mRemoteControlClient.setPlaybackState(RemoteControlClient.PLAYSTATE_PLAYING);
-
-            } else {
-                mRemoteControlClient.setPlaybackState(RemoteControlClient.PLAYSTATE_PAUSED);
-            }
-            mRemoteControlClient.setTransportControlFlags(RemoteControlClient.FLAG_KEY_MEDIA_PLAY_PAUSE | RemoteControlClient.FLAG_KEY_MEDIA_NEXT | RemoteControlClient.FLAG_KEY_MEDIA_PREVIOUS);
         } else {
-            Intent broadcastIntent = new Intent(MESSAGE_NEWTRACKINFORMATION);
-            ArrayList<Parcelable> extraTrackItemList = new ArrayList<Parcelable>();
-            extraTrackItemList.add(new TrackItem());
-            ArrayList<Parcelable> extraNPList = new ArrayList<Parcelable>();
-            extraNPList.add(info);
-            broadcastIntent.putParcelableArrayListExtra(INTENT_TRACKITEMNAME, extraTrackItemList);
-            broadcastIntent.putParcelableArrayListExtra(INTENT_NOWPLAYINGNAME, extraNPList);
-            sendBroadcast(broadcastIntent);
-            mRemoteControlClient.setPlaybackState(RemoteControlClient.PLAYSTATE_STOPPED);
-
+            if (mCurrentPlayingIndex == mCurrentList.size() - 1) {
+                mNextPlayingIndex = -1;
+                setNextTrackForMP();
+            }
         }
     }
 
+    /*
+     * Enables/disables the random function. If enabling randomize next song and
+     * notify the gaplessPlayer about the new track. If deactivating set check
+     * if new track exists and set it to this.
+     */
+    public void setRandom(int random) {
+        mRandom = random;
+        updateStatus(false, false, true);
+        if (mRandom == RANDOMSTATE.RANDOM_ON.ordinal()) {
+            randomizeNextTrack();
+        } else {
+            // Set nextTrack to next in list
+            if ((mCurrentPlayingIndex + 1 < mCurrentList.size()) && mCurrentPlayingIndex >= 0) {
+                mNextPlayingIndex = mCurrentPlayingIndex + 1;
+            }
+        }
+        // Notify GaplessPlayer
+        setNextTrackForMP();
+    }
 
+    /*
+     * Returns the index of the currently playing/paused track
+     */
     public int getCurrentIndex() {
         return mCurrentPlayingIndex;
     }
 
-
+    /*
+     * Returns current track if any is playing/paused at the moment.
+     */
     public TrackItem getCurrentTrack() {
         if (mCurrentPlayingIndex >= 0 && mCurrentList.size() > mCurrentPlayingIndex) {
             return mCurrentList.get(mCurrentPlayingIndex);
@@ -1213,107 +822,268 @@ public class PlaybackService extends Service implements AudioManager.OnAudioFocu
         return null;
     }
 
-    private void sendUpdateBroadcast() {
-        if (mPlayer.isRunning()) {
-            broadcastNowPlaying(new NowPlayingInformation(1, mCurrentList.get(mCurrentPlayingIndex).getTrackURL(), mCurrentPlayingIndex, mRepeat, mRandom));
+    /*
+     * Save the current playlist in mediastore
+     */
+    public void savePlaylist(String name) {
+        Thread savePlaylistThread = new Thread(new SavePlaylistRunner(name, getApplicationContext()));
 
+        savePlaylistThread.start();
+    }
+
+    /*
+     * This method should be safe to call at any time. So it should check the
+     * current state of gaplessplayer, playbackservice and so on.
+     */
+    private synchronized void updateStatus() {
+        updateStatus(true, true, true);
+    }
+
+    private synchronized void updateStatus(boolean updateNotification, boolean updateLockScreen, boolean broadcastNewInfo) {
+        Log.v(TAG, "updatestatus:" + mCurrentPlayingIndex);
+        // Check if playlist contains any tracks otherwise playback should not
+        // be possible
+        if (mCurrentList.size() > 0 && mCurrentPlayingIndex >= 0) {
+            // Check current playback state. If playing inform all listeners and
+            // check if notification is set, and set if not.
+            if (mPlayer.isRunning() && (mCurrentPlayingIndex >= 0) && (mCurrentPlayingIndex < mCurrentList.size())) {
+                // Get the actual trackitem and distribute the information
+                TrackItem trackItem = mCurrentList.get(mCurrentPlayingIndex);
+                if (updateLockScreen)
+                    setLockscreenPicture(trackItem, PLAYSTATE.PLAYING);
+                if (updateNotification)
+                    setNotification(trackItem, PLAYSTATE.PLAYING);
+                if (broadcastNewInfo)
+                    broadcastPlaybackInformation(trackItem, PLAYSTATE.PLAYING);
+            } else if (mPlayer.isPaused() && (mCurrentPlayingIndex >= 0)) {
+                TrackItem trackItem = mCurrentList.get(mCurrentPlayingIndex);
+                if (updateLockScreen)
+                    setLockscreenPicture(trackItem, PLAYSTATE.PAUSE);
+                if (updateNotification)
+                    setNotification(trackItem, PLAYSTATE.PAUSE);
+                if (broadcastNewInfo)
+                    broadcastPlaybackInformation(trackItem, PLAYSTATE.PAUSE);
+            } else {
+                // Remove notification if shown
+                if (updateNotification)
+                    clearNotification();
+                if (updateLockScreen)
+                    setLockscreenPicture(null, PLAYSTATE.STOPPED);
+                if (broadcastNewInfo)
+                    broadcastPlaybackInformation(null, PLAYSTATE.STOPPED);
+            }
         } else {
-            broadcastNowPlaying(new NowPlayingInformation(0, "", -1, mRepeat, mRandom));
+            // No playback, check if notification is set and remove it then
+            if (updateNotification)
+                clearNotification();
+            if (updateLockScreen)
+                setLockscreenPicture(null, PLAYSTATE.STOPPED);
+            // Notify all listeners with broadcast about playing situation
+            if (broadcastNewInfo)
+                broadcastPlaybackInformation(null, PLAYSTATE.STOPPED);
+        }
 
+    }
+
+    /* Removes the Foreground notification */
+    private void clearNotification() {
+        if (mNotification != null) {
+            stopForeground(true);
         }
     }
 
-    private void updateNotification() {
-        Intent resultIntent = new Intent(this, MainActivity.class);
-        resultIntent.putExtra("Fragment", "currentsong");
+    /*
+     * Gets an MetadataEditor from android system. Sets all the attributes
+     * (playing/paused), title/artist/album and applys it. Also sets which
+     * buttons android should show.
+     * 
+     * Starts an thread for Cover generation.
+     * 
+     * TODO: Android >=4.4 remote control seek support.
+     */
+    private void setLockscreenPicture(TrackItem track, PLAYSTATE playbackState) {
+        // Clear if track == null
+        if (track != null && playbackState != PLAYSTATE.STOPPED) {
+            Log.v(TAG, "Setting lockscreen picture/remote controls");
+            RemoteControlClient.MetadataEditor editor = mRemoteControlClient.editMetadata(false);
 
-        PendingIntent resultPendingIntent = PendingIntent.getActivity(this, 0, resultIntent, PendingIntent.FLAG_CANCEL_CURRENT);
+            editor.putBitmap(RemoteControlClient.MetadataEditor.BITMAP_KEY_ARTWORK, null);
 
-        mNotificationBuilder = new NotificationCompat.Builder(this).setSmallIcon(R.drawable.ic_stat_odys).setContentTitle("Odyssey").setContentText("");
+            editor.putString(MediaMetadataRetriever.METADATA_KEY_ALBUM, track.getTrackAlbum());
+            editor.putString(MediaMetadataRetriever.METADATA_KEY_ARTIST, track.getTrackArtist());
+            editor.putString(MediaMetadataRetriever.METADATA_KEY_ALBUMARTIST, track.getTrackArtist());
+            editor.putString(MediaMetadataRetriever.METADATA_KEY_TITLE, track.getTrackTitle());
+            editor.apply();
 
-        // TODO secure
-        String url = mCurrentList.get(mCurrentPlayingIndex).getTrackURL();
-        TrackItem trackItem = MusicLibraryHelper.getTrackItemFromURL(url, getContentResolver());
-        mNotificationBuilder.setContentTitle(trackItem.getTrackTitle());
-        mNotificationBuilder.setContentText(trackItem.getTrackArtist());
-        mNotificationBuilder.setSubText(trackItem.getTrackAlbum());
-
-        // Set Notification image to cover if existing
-        // if ((mCurrentPlayingIndex >= 0) && (mCurrentPlayingIndex <
-        // mCurrentList.size())) {
-        // String where = android.provider.MediaStore.Audio.Albums.ALBUM + "=?";
-        //
-        // String whereVal[] = {
-        // mCurrentList.get(mCurrentPlayingIndex).getTrackAlbum() };
-        //
-        // Cursor cursor =
-        // getContentResolver().query(MediaStore.Audio.Albums.EXTERNAL_CONTENT_URI,
-        // new String[] { MediaStore.Audio.Albums.ALBUM_ART }, where, whereVal,
-        // "");
-        //
-        // String coverPath = null;
-        // if (cursor.moveToFirst()) {
-        // coverPath =
-        // cursor.getString(cursor.getColumnIndex(MediaStore.Audio.Albums.ALBUM_ART));
-        // }
-        //
-        // if (coverPath != null) {
-        // BitmapDrawable cover = (BitmapDrawable)
-        // BitmapDrawable.createFromPath(coverPath);
-        // Bitmap coverBitmap =
-        // Bitmap.createBitmap(cover.getBitmap(),0,0,120,120);
-        //
-        // mNotificationBuilder.setLargeIcon(coverBitmap);
-        // } else {
-        // mNotificationBuilder.setLargeIcon(BitmapFactory.decodeResource(getResources(),
-        // R.drawable.ic_launcher));
-        // }
-        // } else {
-        // mNotificationBuilder.setLargeIcon(BitmapFactory.decodeResource(getResources(),
-        // R.drawable.ic_launcher));
-        // }
-        mNotificationBuilder.setLargeIcon(BitmapFactory.decodeResource(getResources(), R.drawable.ic_launcher));
-        // NotificationCompat.BigTextStyle notificationStyle = new
-        // NotificationCompat.BigTextStyle();
-        // notificationStyle.setBigContentTitle(trackItem.getTrackTitle());
-        // notificationStyle.bigText(trackItem.getTrackAlbum() + "\n" +
-        // trackItem.getTrackArtist());
-        // mNotificationBuilder.setStyle(notificationStyle);
-
-        // Previous song action
-        Intent prevIntent = new Intent(ACTION_PREVIOUS);
-        PendingIntent prevPendingIntent = PendingIntent.getBroadcast(this, 42, prevIntent, PendingIntent.FLAG_UPDATE_CURRENT);
-        mNotificationBuilder.addAction(android.R.drawable.ic_media_previous, "", prevPendingIntent);
-
-        // Pause/Play action
-        if (mPlayer.isRunning()) {
-            Intent pauseIntent = new Intent(ACTION_PAUSE);
-            PendingIntent pausePendingIntent = PendingIntent.getBroadcast(this, 42, pauseIntent, PendingIntent.FLAG_UPDATE_CURRENT);
-            mNotificationBuilder.addAction(android.R.drawable.ic_media_pause, "", pausePendingIntent);
+            // Check playstate for buttons
+            if (playbackState == PLAYSTATE.PLAYING) {
+                mRemoteControlClient.setPlaybackState(RemoteControlClient.PLAYSTATE_PLAYING);
+            } else if (playbackState == PLAYSTATE.PAUSE) {
+                mRemoteControlClient.setPlaybackState(RemoteControlClient.PLAYSTATE_PAUSED);
+            }
+            // Apply some flags, ex. which buttons to show
+            mRemoteControlClient.setTransportControlFlags(RemoteControlClient.FLAG_KEY_MEDIA_PLAY_PAUSE | RemoteControlClient.FLAG_KEY_MEDIA_NEXT | RemoteControlClient.FLAG_KEY_MEDIA_PREVIOUS);
+            mLockscreenCoverGenerator.getImage(track);
         } else {
-            Intent playIntent = new Intent(ACTION_PLAY);
-            PendingIntent playPendingIntent = PendingIntent.getBroadcast(this, 42, playIntent, PendingIntent.FLAG_UPDATE_CURRENT);
-            mNotificationBuilder.addAction(android.R.drawable.ic_media_play, "", playPendingIntent);
+            // Clear lockscreen
+            mRemoteControlClient.setPlaybackState(RemoteControlClient.PLAYSTATE_STOPPED);
+            Log.v(TAG, "Setting lockscreen picture/remote controls to stopped");
         }
+    }
 
-        // Previous song action
-        Intent nextIntent = new Intent(ACTION_NEXT);
-        PendingIntent nextPendingIntent = PendingIntent.getBroadcast(this, 42, nextIntent, PendingIntent.FLAG_UPDATE_CURRENT);
-        mNotificationBuilder.addAction(android.R.drawable.ic_media_next, "", nextPendingIntent);
+    /*
+     * Creates a android system notification with two different remoteViews. One
+     * for the normal layout and one for the big one. Sets the different
+     * attributes of the remoteViews and starts a thread for Cover generation.
+     */
+    private void setNotification(TrackItem track, PLAYSTATE playbackState) {
+        Log.v(TAG, "SetNotification: " + track + " state: " + playbackState.toString());
+        if (track != null && playbackState != PLAYSTATE.STOPPED) {
 
-        mNotificationBuilder.setContentIntent(resultPendingIntent);
+            mNotificationBuilder = new NotificationCompat.Builder(this).setSmallIcon(R.drawable.ic_stat_odys).setContentTitle("Odyssey").setContentText("");
+            RemoteViews remoteViewBig = new RemoteViews(getPackageName(), R.layout.big_notification_layout);
+            RemoteViews remoteViewSmall = new RemoteViews(getPackageName(), R.layout.small_notification_layout);
+            remoteViewBig.setTextViewText(R.id.notificationTitle, track.getTrackTitle());
+            remoteViewBig.setTextViewText(R.id.notificationArtist, track.getTrackArtist());
+            remoteViewBig.setTextViewText(R.id.notificationAlbum, track.getTrackAlbum());
 
-        // Quit action
-        Intent stopIntent = new Intent(ACTION_STOP);
-        PendingIntent stopPendingIntent = PendingIntent.getBroadcast(this, 42, stopIntent, PendingIntent.FLAG_UPDATE_CURRENT);
+            remoteViewSmall.setTextViewText(R.id.notificationTitle, track.getTrackTitle());
+            remoteViewSmall.setTextViewText(R.id.notificationArtist, track.getTrackArtist());
+            remoteViewSmall.setTextViewText(R.id.notificationAlbum, track.getTrackAlbum());
 
-        mNotificationBuilder.setDeleteIntent(stopPendingIntent);
-        // Make notification persistent
-        mNotificationBuilder.setOngoing(true);
+            // Set pendingintents
+            // Previous song action
+            Intent prevIntent = new Intent(ACTION_PREVIOUS);
+            PendingIntent prevPendingIntent = PendingIntent.getBroadcast(this, NOTIFICATION_INTENT_PREVIOUS, prevIntent, PendingIntent.FLAG_UPDATE_CURRENT);
+            remoteViewBig.setOnClickPendingIntent(R.id.notificationPrevBtn, prevPendingIntent);
 
-        mNotification = mNotificationBuilder.build();
-        mNotificationManager.notify(NOTIFICATION_ID, mNotification);
-        startForeground(NOTIFICATION_ID, mNotification);
+            // Pause/Play action
+            if (playbackState == PLAYSTATE.PLAYING) {
+                Intent pauseIntent = new Intent(ACTION_PAUSE);
+                PendingIntent pausePendingIntent = PendingIntent.getBroadcast(this, NOTIFICATION_INTENT_PLAYPAUSE, pauseIntent, PendingIntent.FLAG_UPDATE_CURRENT);
+                remoteViewBig.setOnClickPendingIntent(R.id.notificationPlayBtn, pausePendingIntent);
+                // Set right drawable
+                remoteViewBig.setImageViewResource(R.id.notificationPlayBtn, android.R.drawable.ic_media_pause);
+
+            } else {
+                Intent playIntent = new Intent(ACTION_PLAY);
+                PendingIntent playPendingIntent = PendingIntent.getBroadcast(this, NOTIFICATION_INTENT_PLAYPAUSE, playIntent, PendingIntent.FLAG_UPDATE_CURRENT);
+                remoteViewBig.setOnClickPendingIntent(R.id.notificationPlayBtn, playPendingIntent);
+                // Set right drawable
+                remoteViewBig.setImageViewResource(R.id.notificationPlayBtn, android.R.drawable.ic_media_play);
+            }
+
+            // Next song action
+            Intent nextIntent = new Intent(ACTION_NEXT);
+            PendingIntent nextPendingIntent = PendingIntent.getBroadcast(this, NOTIFICATION_INTENT_NEXT, nextIntent, PendingIntent.FLAG_UPDATE_CURRENT);
+            remoteViewBig.setOnClickPendingIntent(R.id.notificationNextBtn, nextPendingIntent);
+
+            // Quit action
+            Intent quitIntent = new Intent(ACTION_QUIT);
+            PendingIntent quitPendingIntent = PendingIntent.getBroadcast(this, NOTIFICATION_INTENT_QUIT, quitIntent, PendingIntent.FLAG_UPDATE_CURRENT);
+            remoteViewBig.setOnClickPendingIntent(R.id.notificationCloseBtn, quitPendingIntent);
+            remoteViewSmall.setOnClickPendingIntent(R.id.notificationCloseBtn, quitPendingIntent);
+
+            // Cover
+
+            remoteViewBig.setImageViewResource(R.id.notificationImage, R.drawable.ic_big_notification);
+            remoteViewSmall.setImageViewResource(R.id.notificationImage, R.drawable.ic_big_notification);
+
+            mNotificationCoverGenerator.getImage(track);
+
+            // Open application intent
+            Intent resultIntent = new Intent(this, MainActivity.class);
+            resultIntent.putExtra("Fragment", "currentsong");
+            resultIntent.addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP | Intent.FLAG_ACTIVITY_CLEAR_TASK | Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_NO_ANIMATION | Intent.FLAG_ACTIVITY_NO_HISTORY);
+
+            PendingIntent resultPendingIntent = PendingIntent.getActivity(this, NOTIFICATION_INTENT_OPENGUI, resultIntent, PendingIntent.FLAG_UPDATE_CURRENT);
+            mNotificationBuilder.setContentIntent(resultPendingIntent);
+
+            mNotification = mNotificationBuilder.build();
+            mNotification.bigContentView = remoteViewBig;
+            mNotification.contentView = remoteViewSmall;
+            mNotificationManager.notify(NOTIFICATION_ID, mNotification);
+            startForeground(NOTIFICATION_ID, mNotification);
+
+        } else {
+            clearNotification();
+        }
+    }
+
+    /*
+     * Sends an broadcast which contains different kind of information about the
+     * current state of the PlaybackService.
+     */
+    private void broadcastPlaybackInformation(TrackItem track, PLAYSTATE state) {
+        if (track != null) {
+            // Create the broadcast intent
+            Intent broadcastIntent = new Intent(MESSAGE_NEWTRACKINFORMATION);
+
+            // TODO check if extra list is neccessary
+            // Add currentTrack to parcel
+            ArrayList<Parcelable> extraTrackItemList = new ArrayList<Parcelable>();
+            extraTrackItemList.add(mCurrentList.get(mCurrentPlayingIndex));
+
+            // Create NowPlayingInfo for parcel
+            int playing = (state == PLAYSTATE.PLAYING ? 1 : 0);
+            String playingURL = track.getTrackURL();
+            int playingIndex = mCurrentPlayingIndex;
+            int repeat = mRepeat;
+            int random = mRandom;
+            int playlistlength = mCurrentList.size();
+            NowPlayingInformation info = new NowPlayingInformation(playing, playingURL, playingIndex, repeat, random, playlistlength);
+
+            // Add nowplayingInfo to parcel
+            ArrayList<Parcelable> extraNPList = new ArrayList<Parcelable>();
+            extraNPList.add(info);
+
+            // Add this stuff to the parcel
+            broadcastIntent.putParcelableArrayListExtra(INTENT_TRACKITEMNAME, extraTrackItemList);
+            broadcastIntent.putParcelableArrayListExtra(INTENT_NOWPLAYINGNAME, extraNPList);
+
+            // We're good to go, send it away
+            sendBroadcast(broadcastIntent);
+        } else {
+            // TODO fix Widget and stuff for tolerance without this information
+            // Send empty broadcast with stopped information
+            Intent broadcastIntent = new Intent(MESSAGE_NEWTRACKINFORMATION);
+
+            // Add empty trackitem to parcel
+            ArrayList<Parcelable> extraTrackItemList = new ArrayList<Parcelable>();
+            extraTrackItemList.add(new TrackItem());
+
+            NowPlayingInformation info = new NowPlayingInformation(0, "", -1, mRepeat, mRandom, mCurrentList.size());
+            // Add nowplayingInfo to parcel
+            ArrayList<Parcelable> extraNPList = new ArrayList<Parcelable>();
+            extraNPList.add(info);
+
+            // Add this stuff to the parcel
+            broadcastIntent.putParcelableArrayListExtra(INTENT_TRACKITEMNAME, extraTrackItemList);
+            broadcastIntent.putParcelableArrayListExtra(INTENT_NOWPLAYINGNAME, extraNPList);
+
+            // We're good to go, send it away
+            sendBroadcast(broadcastIntent);
+        }
+    }
+
+    /*
+     * True if the GaplessPlayer is actually playing a song.
+     */
+    public boolean isPlaying() {
+        return mPlayer.isRunning();
+    }
+
+    /*
+     * Handles all the exceptions from the GaplessPlayer. For now it justs stops
+     * itself and outs an Toast message to the user. Thats the best we could
+     * think of now :P.
+     */
+    private void handlePlaybackException(PlaybackException exception) {
+        Log.v(TAG, "Exception occured: " + exception.getReason().toString());
+        Toast.makeText(getBaseContext(), TAG + ":" + exception.getReason().toString(), Toast.LENGTH_LONG).show();
+        // TODO better handling?
+        // Stop service on exception for now
+        stopService();
     }
 
     private final static class PlaybackServiceStub extends IOdysseyPlaybackService.Stub {
@@ -1429,37 +1199,37 @@ public class PlaybackService extends Service implements AudioManager.OnAudioFocu
 
         @Override
         public String getArtist() throws RemoteException {
-            // TODO Auto-generated method stub
-            return null;
+            TrackItem track = mService.get().getCurrentTrack();
+            if (track != null) {
+                return track.getTrackArtist();
+            }
+            return "";
         }
 
         @Override
         public String getAlbum() throws RemoteException {
-            // TODO Auto-generated method stub
-            return null;
+            TrackItem track = mService.get().getCurrentTrack();
+            if (track != null) {
+                return track.getTrackAlbum();
+            }
+            return "";
         }
 
         @Override
         public String getTrackname() throws RemoteException {
-            // TODO Auto-generated method stub
-            return null;
+            TrackItem track = mService.get().getCurrentTrack();
+            if (track != null) {
+                return track.getTrackTitle();
+            }
+            return "";
         }
 
         @Override
         public int getTrackNo() throws RemoteException {
-            // TODO Auto-generated method stub
-            return 0;
-        }
-
-        @Override
-        public int getBitrate() throws RemoteException {
-            // TODO Auto-generated method stub
-            return 0;
-        }
-
-        @Override
-        public int getSamplerate() throws RemoteException {
-            // TODO Auto-generated method stub
+            TrackItem track = mService.get().getCurrentTrack();
+            if (track != null) {
+                return track.getTrackNumber();
+            }
             return 0;
         }
 
@@ -1512,16 +1282,6 @@ public class PlaybackService extends Service implements AudioManager.OnAudioFocu
         }
 
         @Override
-        public void registerNowPlayingReceiver(IOdysseyNowPlayingCallback receiver) throws RemoteException {
-            mService.get().registerNowPlayingCallback(receiver);
-        }
-
-        @Override
-        public void unregisterNowPlayingReceiver(IOdysseyNowPlayingCallback receiver) throws RemoteException {
-            mService.get().unregisterNowPlayingCallback(receiver);
-        }
-
-        @Override
         public void togglePause() throws RemoteException {
             ControlObject obj = new ControlObject(ControlObject.PLAYBACK_ACTION.ODYSSEY_TOGGLEPAUSE);
             Message msg = mService.get().getHandler().obtainMessage();
@@ -1536,8 +1296,7 @@ public class PlaybackService extends Service implements AudioManager.OnAudioFocu
 
         @Override
         public int getTrackDuration() throws RemoteException {
-            // TODO Auto-generated method stub
-            return 0;
+            return mService.get().getTrackDuration();
         }
 
         @Override
@@ -1591,6 +1350,14 @@ public class PlaybackService extends Service implements AudioManager.OnAudioFocu
         }
 
         @Override
+        public void playAllTracksShuffled() throws RemoteException {
+            ControlObject obj = new ControlObject(ControlObject.PLAYBACK_ACTION.ODYSSEY_PLAYALLTRACKSSHUFFLED);
+            Message msg = mService.get().getHandler().obtainMessage();
+            msg.obj = obj;
+            mService.get().getHandler().sendMessage(msg);
+        }
+
+        @Override
         public void playAllTracks() throws RemoteException {
             ControlObject obj = new ControlObject(ControlObject.PLAYBACK_ACTION.ODYSSEY_PLAYALLTRACKS);
             Message msg = mService.get().getHandler().obtainMessage();
@@ -1602,69 +1369,82 @@ public class PlaybackService extends Service implements AudioManager.OnAudioFocu
         public int getCurrentIndex() throws RemoteException {
             return mService.get().getCurrentIndex();
         }
-    }
 
-    private class PlaybackStartListener implements GaplessPlayer.OnTrackStartedListener {
-        private PlaybackService mPlaybackService;
-
-        public PlaybackStartListener(PlaybackService service) {
-            mPlaybackService = service;
+        @Override
+        public int getPlaying() throws RemoteException {
+            return mService.get().isPlaying() ? 1 : 0;
         }
 
         @Override
-        public void onTrackStarted(String URI) {
-            Log.v(TAG, "track started: " + URI + " PL index: " + mCurrentPlayingIndex);
+        public void savePlaylist(String name) throws RemoteException {
+            ControlObject obj = new ControlObject(ControlObject.PLAYBACK_ACTION.ODYSSEY_SAVEPLAYLIST, name);
+            Message msg = mService.get().getHandler().obtainMessage();
+            msg.obj = obj;
+            mService.get().getHandler().sendMessage(msg);
+        }
+    }
 
-            broadcastNowPlaying(new NowPlayingInformation(1, mCurrentList.get(mCurrentPlayingIndex).getTrackURL(), mCurrentPlayingIndex, mRepeat, mRandom));
-            updateNotification();
-            if (mTempWakelock.isHeld()) {
-                // we could release wakelock here already
-                mTempWakelock.release();
+    /*
+     * Sets the index of the track to play next to a random generated one.
+     */
+    private void randomizeNextTrack() {
+        // Set next index to random one
+        if (mCurrentList.size() > 0) {
+            mNextPlayingIndex = mRandomGenerator.nextInt(mCurrentList.size());
+
+            // if next index equal to current index create a new random
+            // index but just trying 20 times
+            int counter = 0;
+            while (mNextPlayingIndex == mCurrentPlayingIndex && counter > 20) {
+                mCurrentPlayingIndex = mRandomGenerator.nextInt(mCurrentList.size());
+                counter++;
             }
         }
     }
 
-    private class PlaybackFinishListener implements GaplessPlayer.OnTrackFinishedListener {
-
-        @Override
-        public void onTrackFinished() {
-            Log.v(TAG, "Playback of index: " + mCurrentPlayingIndex + " finished ");
-            // Check if random is active
-
-            // Broadcast simple.last.fm.scrobble broadcast
-            TrackItem item = mCurrentList.get(mCurrentPlayingIndex);
-            Log.v(TAG, "Send to SLS: " + item);
-            Intent bCast = new Intent("com.adam.aslfms.notify.playstatechanged");
-            bCast.putExtra("state", 3);
-            bCast.putExtra("app-name", "Odyssey");
-            bCast.putExtra("app-package", "org.odyssey");
-            bCast.putExtra("artist", item.getTrackArtist());
-            bCast.putExtra("album", item.getTrackAlbum());
-            bCast.putExtra("track", item.getTrackTitle());
-            bCast.putExtra("duration", item.getTrackDuration() / 1000);
-            sendBroadcast(bCast);
-
-            if (mRandom == RANDOMSTATE.RANDOM_ON.ordinal()) {
-                // save lastindex for previous
-                mLastPlayingIndex = mCurrentPlayingIndex;
-
-                // set currentindex to nextindex if exists
-                if (mNextPlayingIndex == -1) {
-                    // create new random index
-                    mCurrentPlayingIndex = mRandomGenerator.nextInt(mCurrentList.size());
-                    // if next index equal to current index create a new random
-                    // index but just trying 20 times
-                    int counter = 0;
-                    while (mLastPlayingIndex == mCurrentPlayingIndex && counter > 20) {
-                        mCurrentPlayingIndex = mRandomGenerator.nextInt(mCurrentList.size());
-                        counter++;
-                    }
-                } else {
-                    mCurrentPlayingIndex = mNextPlayingIndex;
+    /*
+     * Sets the next track of the GaplessPlayer to the nextTrack in the queue so
+     * there can be a smooth transition from one track to the next one.
+     */
+    private void setNextTrackForMP() {
+        // If player is not running or at least prepared, this makes no sense
+        if (mPlayer.isPrepared() || mPlayer.isRunning()) {
+            // Sets the next track for gapless playing
+            if (mNextPlayingIndex >= 0 && mNextPlayingIndex < mCurrentList.size()) {
+                try {
+                    mPlayer.setNextTrack(mCurrentList.get(mNextPlayingIndex).getTrackURL());
+                } catch (PlaybackException e) {
+                    handlePlaybackException(e);
                 }
-                broadcastNowPlaying(new NowPlayingInformation(1, mCurrentList.get(mCurrentPlayingIndex).getTrackURL(), mCurrentPlayingIndex, mRepeat, mRandom));
-                updateNotification();
+            } else {
+                try {
+                    /*
+                     * No tracks remains. So set it to null. GaplessPlayer knows
+                     * who to handle this :)
+                     */
 
+                    mPlayer.setNextTrack(null);
+                } catch (PlaybackException e) {
+                    handlePlaybackException(e);
+                }
+            }
+        }
+    }
+
+    /*
+     * Listener class for playback begin of the GaplessPlayer. Handles the
+     * different scenarios: If no random playback is active, check if new track
+     * is ready and set index and GaplessPlayer to it. If no track remains in
+     * queue check if repeat is activated and if reset queue to track 0. momIf
+     * not generate a random index and set GaplessPlayer to that random track.
+     */
+    private class PlaybackStartListener implements GaplessPlayer.OnTrackStartedListener {
+        @Override
+        public void onTrackStarted(String URI) {
+            mCurrentPlayingIndex = mNextPlayingIndex;
+            Log.v(TAG, "track started: " + URI + " PL index: " + mCurrentPlayingIndex);
+
+            if (mCurrentPlayingIndex >= 0 && mCurrentPlayingIndex < mCurrentList.size()) {
                 // Broadcast simple.last.fm.scrobble broadcast
                 TrackItem newTrackitem = mCurrentList.get(mCurrentPlayingIndex);
                 Log.v(TAG, "Send to SLS: " + newTrackitem);
@@ -1677,115 +1457,85 @@ public class PlaybackService extends Service implements AudioManager.OnAudioFocu
                 newbCast.putExtra("track", newTrackitem.getTrackTitle());
                 newbCast.putExtra("duration", newTrackitem.getTrackDuration() / 1000);
                 sendBroadcast(newbCast);
+            }
+            // Notify all the things
+            updateStatus();
 
-                // create new random nextindex
-                mNextPlayingIndex = mRandomGenerator.nextInt(mCurrentList.size());
-                // if next index equal to current index create a new random
-                // index but just trying 20 times
-                int counter = 0;
-                while (mNextPlayingIndex == mCurrentPlayingIndex && counter > 20) {
-                    mNextPlayingIndex = mRandomGenerator.nextInt(mCurrentList.size());
-                    counter++;
-                }
-
-                // set next track for gapless playback
-                if (mNextPlayingIndex < mCurrentList.size() && (mNextPlayingIndex >= 0)) {
-                    try {
-                        mPlayer.setNextTrack(mCurrentList.get(mNextPlayingIndex).getTrackURL());
-                    } catch (IllegalArgumentException e) {
-                        // In case of error stop playback and log error
-                        mPlayer.stop();
-                        Log.e(TAG, "IllegalArgument for playback");
-                        Toast.makeText(getBaseContext(), "Playback illegal argument  error", Toast.LENGTH_LONG).show();
-                    } catch (SecurityException e) {
-                        // In case of error stop playback and log error
-                        mPlayer.stop();
-                        Log.e(TAG, "SecurityException for playback");
-                        Toast.makeText(getBaseContext(), "Playback security error", Toast.LENGTH_LONG).show();
-                    } catch (IllegalStateException e) {
-                        // In case of error stop playback and log error
-                        mPlayer.stop();
-                        Log.e(TAG, "IllegalState for playback");
-                        Toast.makeText(getBaseContext(), "Playback state error", Toast.LENGTH_LONG).show();
-                    } catch (IOException e) {
-                        // In case of error stop playback and log error
-                        mPlayer.stop();
-                        Log.e(TAG, "IOException for playback");
-                        Toast.makeText(getBaseContext(), "Playback IO error", Toast.LENGTH_LONG).show();
+            if (mRandom == RANDOMSTATE.RANDOM_OFF.ordinal()) {
+                // Random off
+                if (mCurrentPlayingIndex + 1 < mCurrentList.size()) {
+                    mNextPlayingIndex = mCurrentPlayingIndex + 1;
+                } else {
+                    if (mRepeat == REPEATSTATE.REPEAT_ALL.ordinal()) {
+                        // Repeat on so set to first PL song if last song is
+                        // reached
+                        if (mCurrentList.size() > 0 && mCurrentPlayingIndex + 1 == mCurrentList.size()) {
+                            mNextPlayingIndex = 0;
+                        }
+                    } else {
+                        // No song remains and not repating
+                        mNextPlayingIndex = -1;
                     }
                 }
             } else {
-
-                // save lastindex for previous in random mode
-                mLastPlayingIndex = mCurrentPlayingIndex;
-
-                // Check if this song was the last one in the playlist
-                if ((mCurrentPlayingIndex + 1) == mCurrentList.size()) {
-                    if (mRepeat == REPEATSTATE.REPEAT_ALL.ordinal()) {
-                        // Was last song in list so repeat playlist
-                        jumpToIndex(0, true);
-                    } else {
-                        // Was last song in list stop everything
-                        Log.v(TAG, "Last song played");
-                        stop();
-                    }
-                } else {
-                    // At least one song to go
-                    mCurrentPlayingIndex++;
-                    broadcastNowPlaying(new NowPlayingInformation(1, mCurrentList.get(mCurrentPlayingIndex).getTrackURL(), mCurrentPlayingIndex, mRepeat, mRandom));
-                    updateNotification();
-
-                    // Broadcast simple.last.fm.scrobble broadcast
-                    TrackItem newTrackitem = mCurrentList.get(mCurrentPlayingIndex);
-                    Log.v(TAG, "Send to SLS: " + newTrackitem);
-                    Intent newbCast = new Intent("com.adam.aslfms.notify.playstatechanged");
-                    newbCast.putExtra("state", 0);
-                    newbCast.putExtra("app-name", "Odyssey");
-                    newbCast.putExtra("app-package", "org.odyssey");
-                    newbCast.putExtra("artist", newTrackitem.getTrackArtist());
-                    newbCast.putExtra("album", newTrackitem.getTrackAlbum());
-                    newbCast.putExtra("track", newTrackitem.getTrackTitle());
-                    newbCast.putExtra("duration", newTrackitem.getTrackDuration() / 1000);
-                    sendBroadcast(newbCast);
-
-                    /*
-                     * Check if we even have one more song to play if it is the
-                     * case, schedule it for next playback (gapless playback)
-                     */
-                    if (mCurrentPlayingIndex + 1 < mCurrentList.size()) {
-                        try {
-                            mPlayer.setNextTrack(mCurrentList.get(mCurrentPlayingIndex + 1).getTrackURL());
-                        } catch (IllegalArgumentException e) {
-                            // In case of error stop playback and log error
-                            mPlayer.stop();
-                            Log.e(TAG, "IllegalArgument for playback");
-                            Toast.makeText(getBaseContext(), "Playback illegal argument  error", Toast.LENGTH_LONG).show();
-                        } catch (SecurityException e) {
-                            // In case of error stop playback and log error
-                            mPlayer.stop();
-                            Log.e(TAG, "SecurityException for playback");
-                            Toast.makeText(getBaseContext(), "Playback security error", Toast.LENGTH_LONG).show();
-                        } catch (IllegalStateException e) {
-                            // In case of error stop playback and log error
-                            mPlayer.stop();
-                            Log.e(TAG, "IllegalState for playback");
-                            Toast.makeText(getBaseContext(), "Playback state error", Toast.LENGTH_LONG).show();
-                        } catch (IOException e) {
-                            // In case of error stop playback and log error
-                            mPlayer.stop();
-                            Log.e(TAG, "IOException for playback");
-                            Toast.makeText(getBaseContext(), "Playback IO error", Toast.LENGTH_LONG).show();
-                        }
-                    }
-                }
+                // Random on
+                randomizeNextTrack();
             }
 
-        }
+            // Sets the next track for gapless playing
+            setNextTrackForMP();
 
+            if (mTempWakelock.isHeld()) {
+                // we could release wakelock here already
+                mTempWakelock.release();
+            }
+        }
     }
 
+    /*
+     * Listener class for the GaplessPlayer. If a track finishes playback send
+     * it to the simple last.fm scrobbler. Check if this was the last track of
+     * the queue and if so send an update to all the things like
+     * notification,broadcastreceivers and lockscreen. Stop the service.
+     */
+    private class PlaybackFinishListener implements GaplessPlayer.OnTrackFinishedListener {
+
+        @Override
+        public void onTrackFinished() {
+            Log.v(TAG, "Playback of index: " + mCurrentPlayingIndex + " finished ");
+            // Remember the last track index for moving backwards in the queue.
+            mLastPlayingIndex = mCurrentPlayingIndex;
+            if (mCurrentList.size() > 0 && mCurrentPlayingIndex >= 0 && (mCurrentPlayingIndex < mCurrentList.size())) {
+                // Broadcast simple.last.fm.scrobble broadcast
+                TrackItem item = mCurrentList.get(mCurrentPlayingIndex);
+                Log.v(TAG, "Send to SLS: " + item);
+                Intent bCast = new Intent("com.adam.aslfms.notify.playstatechanged");
+                bCast.putExtra("state", 3);
+                bCast.putExtra("app-name", "Odyssey");
+                bCast.putExtra("app-package", "org.odyssey");
+                bCast.putExtra("artist", item.getTrackArtist());
+                bCast.putExtra("album", item.getTrackAlbum());
+                bCast.putExtra("track", item.getTrackTitle());
+                bCast.putExtra("duration", item.getTrackDuration() / 1000);
+                sendBroadcast(bCast);
+            }
+
+            // No more tracks
+            if (mNextPlayingIndex == -1) {
+                stop();
+                updateStatus();
+            }
+        }
+    }
+
+    /*
+     * Callback method for AudioFocus changes. If audio focus change a call got
+     * in or a notification for example. React to the different kinds of
+     * changes. Resumes on regaining.
+     */
     @Override
     public void onAudioFocusChange(int focusChange) {
+        Log.v(TAG, "Audiofocus changed");
         switch (focusChange) {
         case AudioManager.AUDIOFOCUS_GAIN:
             Log.v(TAG, "Gained audiofocus");
@@ -1793,21 +1543,22 @@ public class PlaybackService extends Service implements AudioManager.OnAudioFocu
                 mPlayer.setVolume(1.0f, 1.0f);
                 mIsDucked = false;
             } else if (mLostAudioFocus) {
-                mPlayer.resume();
+                resume();
                 mLostAudioFocus = false;
             }
             break;
         case AudioManager.AUDIOFOCUS_LOSS:
             Log.v(TAG, "Lost audiofocus");
             // Stop playback service
-            // TODO save playlist position
-            stop();
+            if (isPlaying()) {
+                pause();
+            }
             break;
         case AudioManager.AUDIOFOCUS_LOSS_TRANSIENT:
             Log.v(TAG, "Lost audiofocus temporarily");
             // Pause audio for the moment of focus loss
             if (mPlayer.isRunning()) {
-                mPlayer.pause();
+                pause();
                 mLostAudioFocus = true;
             }
             break;
@@ -1824,10 +1575,18 @@ public class PlaybackService extends Service implements AudioManager.OnAudioFocu
 
     }
 
-    private final BroadcastReceiver mNoisyReceiver = new BroadcastReceiver() {
+    private BroadcastControlReceiver mNoisyReceiver = null;
+
+    /*
+     * Receiver class for all the different broadcasts which are able to control
+     * the PlaybackService. Also the receiver for the noisy event (e.x.
+     * headphone unplugging)
+     */
+    private class BroadcastControlReceiver extends BroadcastReceiver {
 
         @Override
         public void onReceive(Context context, Intent intent) {
+            Log.v(TAG, "Broadcast received: " + intent.getAction());
             if (intent.getAction().equals(android.media.AudioManager.ACTION_AUDIO_BECOMING_NOISY)) {
                 Log.v(TAG, "NOISY AUDIO! CANCEL MUSIC");
                 pause();
@@ -1843,28 +1602,140 @@ public class PlaybackService extends Service implements AudioManager.OnAudioFocu
                 stop();
             } else if (intent.getAction().equals(ACTION_TOGGLEPAUSE)) {
                 togglePause();
+            } else if (intent.getAction().equals(ACTION_QUIT)) {
+                stopService();
             }
         }
 
     };
 
+    /*
+     * Stops the service after a specific amount of time
+     */
     private class ServiceCancelTask extends TimerTask {
 
         @Override
         public void run() {
-        	Log.v(TAG, "Cancel odyssey playbackservice");
-            stop();
+            Log.v(TAG, "Cancel odyssey playbackservice");
+            stopService();
+        }
+    }
+
+    /*
+     * Receives the generated album picture from a separate thread for the
+     * notification controls. Sets it and notifies the system that the
+     * notification has changed
+     */
+    private class NotificationCoverListener implements MusicLibraryHelper.CoverBitmapListener {
+
+        @Override
+        public void receiveBitmap(BitmapDrawable bm) {
+            Log.v(TAG, "Received notification bm");
+            // Check if notification exists and set picture
+            if (mNotification != null && mNotification.bigContentView != null && bm != null) {
+                // Set the image in the remoteView
+                mNotification.bigContentView.setImageViewBitmap(R.id.notificationImage, bm.getBitmap());
+                // Notify android about the change
+                mNotificationManager.notify(NOTIFICATION_ID, mNotification);
+            }
+            if (mNotification != null && mNotification.contentView != null && bm != null) {
+                // Set the image in the remoteView
+                mNotification.contentView.setImageViewBitmap(R.id.notificationImage, bm.getBitmap());
+                // Notify android about the change
+                mNotificationManager.notify(NOTIFICATION_ID, mNotification);
+            }
         }
 
     }
 
-    private class RemoteController extends RemoteControlClient {
+    /*
+     * Receives the generated album picture from a separate thread for the
+     * lockscreen controls. Also sets the title/artist/album again otherwise
+     * android would sometimes set it to the track before
+     */
+    private class LockscreenCoverListener implements MusicLibraryHelper.CoverBitmapListener {
 
-        public RemoteController(PendingIntent mediaButtonIntent) {
-            super(mediaButtonIntent);
-            // TODO Auto-generated constructor stub
+        @Override
+        public void receiveBitmap(BitmapDrawable bm) {
+            if (bm != null) {
+                // Gets the system MetaData editor for lockscreen control
+                RemoteControlClient.MetadataEditor editor = mRemoteControlClient.editMetadata(false);
+                TrackItem track = getCurrentTrack();
+                if (track == null) {
+                    return;
+                }
+
+                // Set all the different things
+                editor.putString(MediaMetadataRetriever.METADATA_KEY_ALBUM, track.getTrackAlbum());
+                editor.putString(MediaMetadataRetriever.METADATA_KEY_ARTIST, track.getTrackArtist());
+                editor.putString(MediaMetadataRetriever.METADATA_KEY_ALBUMARTIST, track.getTrackArtist());
+                editor.putString(MediaMetadataRetriever.METADATA_KEY_TITLE, track.getTrackTitle());
+                editor.putBitmap(RemoteControlClient.MetadataEditor.BITMAP_KEY_ARTWORK, bm.getBitmap());
+
+                // Apply values here
+                editor.apply();
+            }
         }
 
     }
 
+    /*
+     * Save playlist async
+     */
+    private class SavePlaylistRunner implements Runnable {
+
+        private String mPlaylistName;
+        private Context mContext;
+
+        public SavePlaylistRunner(String name, Context context) {
+            mPlaylistName = name;
+            mContext = context;
+        }
+
+        @Override
+        public void run() {
+
+            // remove playlist if exists
+            mContext.getContentResolver().delete(MediaStore.Audio.Playlists.EXTERNAL_CONTENT_URI, MediaStore.Audio.Playlists.NAME + "=?", new String[] { mPlaylistName });
+
+            // create new playlist and save row
+            ContentValues mInserts = new ContentValues();
+            mInserts.put(MediaStore.Audio.Playlists.NAME, mPlaylistName);
+            mInserts.put(MediaStore.Audio.Playlists.DATE_ADDED, System.currentTimeMillis());
+            mInserts.put(MediaStore.Audio.Playlists.DATE_MODIFIED, System.currentTimeMillis());
+
+            Uri currentRow = mContext.getContentResolver().insert(MediaStore.Audio.Playlists.EXTERNAL_CONTENT_URI, mInserts);
+
+            // insert current tracks
+
+            // TODO optimize
+            String[] projection = { MediaStore.Audio.Media._ID, MediaStore.Audio.Media.DATA };
+            String where = MediaStore.Audio.Media.DATA + "=?";
+
+            TrackItem item = null;
+
+            for (int i = 0; i < mCurrentList.size(); i++) {
+
+                item = mCurrentList.get(i);
+
+                if (item != null) {
+                    String[] whereVal = { item.getTrackURL() };
+
+                    // get ID of current track
+                    Cursor c = mContext.getContentResolver().query(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, projection, where, whereVal, null);
+
+                    if (c.moveToFirst()) {
+                        // insert track into playlist
+                        String id = c.getString(c.getColumnIndex(MediaStore.Audio.Media._ID));
+
+                        mInserts.clear();
+                        mInserts.put(MediaStore.Audio.Playlists.Members.AUDIO_ID, id);
+                        mInserts.put(MediaStore.Audio.Playlists.Members.PLAY_ORDER, i);
+
+                        mContext.getContentResolver().insert(currentRow, mInserts);
+                    }
+                }
+            }
+        }
+    }
 }

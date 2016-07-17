@@ -1,16 +1,24 @@
 package org.odyssey.fragments;
 
+import java.util.ArrayList;
+
 import org.odyssey.MainActivity;
 import org.odyssey.NowPlayingInformation;
-import org.odyssey.OdysseyApplication;
 import org.odyssey.R;
 import org.odyssey.playbackservice.IOdysseyPlaybackService;
+import org.odyssey.playbackservice.PlaybackService;
+import org.odyssey.playbackservice.PlaybackServiceConnection;
 import org.odyssey.playbackservice.TrackItem;
 
 import android.app.Activity;
+import android.content.BroadcastReceiver;
+import android.content.Context;
+import android.content.Intent;
+import android.content.IntentFilter;
 import android.os.Bundle;
 import android.os.RemoteException;
 import android.support.v4.app.Fragment;
+import android.util.Log;
 import android.view.ContextMenu;
 import android.view.ContextMenu.ContextMenuInfo;
 import android.view.LayoutInflater;
@@ -27,7 +35,7 @@ import android.widget.ImageView;
 import android.widget.ListView;
 import android.widget.TextView;
 
-public class PlaylistFragment extends Fragment implements OdysseyApplication.NowPlayingListener {
+public class PlaylistFragment extends Fragment {
 
     private static final String TAG = "OdysseyPlaylistFragment";
     private int mPlayingIndex = 0;
@@ -35,7 +43,8 @@ public class PlaylistFragment extends Fragment implements OdysseyApplication.Now
 
     private PlaylistTracksAdapter mPlayListAdapter;
 
-    private IOdysseyPlaybackService mPBService = null;
+    private PlaybackServiceConnection mServiceConnection = null;
+    private NowPlayingReceiver mNowPlayingReceiver = null;
 
     @Override
     public View onCreateView(LayoutInflater inflater, ViewGroup container, Bundle savedInstanceState) {
@@ -43,13 +52,13 @@ public class PlaylistFragment extends Fragment implements OdysseyApplication.Now
         // set visibility of quickcontrols
         ((MainActivity) getActivity()).getQuickControl().setVisibility(View.VISIBLE);
 
+        // Set actionbar title
+        getActivity().getActionBar().setTitle(R.string.playlist_fragment_title);
+
         // indicate this fragment has its own menu
         setHasOptionsMenu(true);
 
         View rootView = inflater.inflate(R.layout.fragment_playlist, container, false);
-
-        // create adapter for tracklist
-        mPlayListAdapter = new PlaylistTracksAdapter(((OdysseyApplication) getActivity().getApplication()).getPlaybackService());
 
         // create listview for tracklist
         mListView = (ListView) rootView.findViewById(R.id.listViewPlaylist);
@@ -63,10 +72,9 @@ public class PlaylistFragment extends Fragment implements OdysseyApplication.Now
             public void onItemClick(AdapterView<?> arg0, View viewItem, int position, long id) {
 
                 // Get main application object for service connection
-                OdysseyApplication app = (OdysseyApplication) getActivity().getApplication();
 
                 try {
-                    app.getPlaybackService().jumpTo(position);
+                    mServiceConnection.getPBS().jumpTo(position);
                 } catch (RemoteException e) {
                     // TODO Auto-generated catch block
                     e.printStackTrace();
@@ -75,11 +83,6 @@ public class PlaylistFragment extends Fragment implements OdysseyApplication.Now
             }
         });
 
-        OdysseyApplication mainApplication = (OdysseyApplication) getActivity().getApplication();
-
-        mainApplication.registerNowPlayingListener(this);
-
-        // register context menu
         registerForContextMenu(mListView);
 
         return rootView;
@@ -92,21 +95,38 @@ public class PlaylistFragment extends Fragment implements OdysseyApplication.Now
     }
 
     @Override
+    public void onPause() {
+        super.onPause();
+        // Unregister registered broadcast receiver to save some resources
+        if (mNowPlayingReceiver != null) {
+            getActivity().getApplicationContext().unregisterReceiver(mNowPlayingReceiver);
+            mNowPlayingReceiver = null;
+        }
+        mServiceConnection.closeConnection();
+        mServiceConnection = null;
+    }
+
+    @Override
+    public void onDetach() {
+        super.onDetach();
+        mServiceConnection = null;
+    }
+
+    @Override
     public void onResume() {
         super.onResume();
-        mPBService = ((OdysseyApplication) getActivity().getApplication()).getPlaybackService();
-        mPlayListAdapter = new PlaylistTracksAdapter(mPBService);
-        mListView.setAdapter(mPlayListAdapter);
-
-        try {
-            mPlayingIndex = mPBService.getCurrentIndex();
-        } catch (RemoteException e) {
-            // TODO Auto-generated catch block
-            e.printStackTrace();
+        // Register receiver to get newest information
+        if (mNowPlayingReceiver != null) {
+            getActivity().getApplicationContext().unregisterReceiver(mNowPlayingReceiver);
+            mNowPlayingReceiver = null;
         }
+        mNowPlayingReceiver = new NowPlayingReceiver();
+        getActivity().getApplicationContext().registerReceiver(mNowPlayingReceiver, new IntentFilter(PlaybackService.MESSAGE_NEWTRACKINFORMATION));
 
-        mListView.setSelection(mPlayingIndex);
-        mPlayListAdapter.notifyDataSetChanged();
+        // Reopen service connection
+        mServiceConnection = new PlaybackServiceConnection(getActivity().getApplicationContext());
+        mServiceConnection.setNotifier(new ServiceListener());
+        mServiceConnection.openConnection();
     }
 
     @Override
@@ -119,31 +139,24 @@ public class PlaylistFragment extends Fragment implements OdysseyApplication.Now
 
     @Override
     public boolean onOptionsItemSelected(MenuItem item) {
-
-        OdysseyApplication app = (OdysseyApplication) getActivity().getApplication();
-
         switch (item.getItemId()) {
         case R.id.action_clearplaylist:
-            try {
-                app.getPlaybackService().clearPlaylist();
-                mPlayListAdapter.clear();
-                mPlayListAdapter.notifyDataSetChanged();
-            } catch (RemoteException e1) {
-                // TODO Auto-generated catch block
-                e1.printStackTrace();
-            }
+            mPlayListAdapter.clear();
+            return true;
+        case R.id.action_saveplaylist:
+            openPlaylistNameDialog();
             return true;
         case R.id.action_jumpcurrent:
             mListView.setSelection(mPlayingIndex);
             return true;
         case R.id.action_shuffleplaylist:
             try {
-                app.getPlaybackService().shufflePlaylist();
-                mPlayListAdapter.notifyDataSetChanged();
+                mServiceConnection.getPBS().shufflePlaylist();
             } catch (RemoteException e) {
                 // TODO Auto-generated catch block
                 e.printStackTrace();
             }
+            mPlayListAdapter.notifyDataSetChanged();
             return true;
         }
         return super.onOptionsItemSelected(item);
@@ -274,31 +287,10 @@ public class PlaylistFragment extends Fragment implements OdysseyApplication.Now
             try {
                 mPlaybackService.clearPlaylist();
             } catch (RemoteException e) {
-                // TODO Auto-generated catch block
                 e.printStackTrace();
             }
             notifyDataSetChanged();
         }
-
-    }
-
-    @Override
-    public void onNewInformation(NowPlayingInformation info) {
-        mPlayingIndex = info.getPlayingIndex();
-        new Thread() {
-            public void run() {
-                Activity activity = (Activity) getActivity();
-                if (activity != null) {
-                    activity.runOnUiThread(new Runnable() {
-                        @Override
-                        public void run() {
-                            mListView.setSelection(mPlayingIndex);
-                            mPlayListAdapter.notifyDataSetChanged();
-                        }
-                    });
-                }
-            }
-        }.start();
 
     }
 
@@ -322,11 +314,10 @@ public class PlaylistFragment extends Fragment implements OdysseyApplication.Now
             mPlayListAdapter.remove(info.position);
             return true;
         case R.id.playlist_context_menu_action_playnext:
-            OdysseyApplication app = (OdysseyApplication) getActivity().getApplication();
             TrackItem track = (TrackItem) mListView.getAdapter().getItem(info.position);
             mPlayListAdapter.remove(info.position);
             try {
-                app.getPlaybackService().enqueueTrackAsNext(track);
+                mServiceConnection.getPBS().enqueueTrackAsNext(track);
             } catch (RemoteException e) {
                 // TODO Auto-generated catch block
                 e.printStackTrace();
@@ -337,4 +328,76 @@ public class PlaylistFragment extends Fragment implements OdysseyApplication.Now
         }
     }
 
+    private void updateSelectionInGUI() {
+        Activity activity = (Activity) getActivity();
+        if (activity != null) {
+            activity.runOnUiThread(new Runnable() {
+                @Override
+                public void run() {
+                    mListView.setSelection(mPlayingIndex);
+                    mPlayListAdapter.notifyDataSetChanged();
+                }
+            });
+        }
+    }
+
+    private class NowPlayingReceiver extends BroadcastReceiver {
+
+        @Override
+        public void onReceive(Context context, Intent intent) {
+            if (intent.getAction().equals(PlaybackService.MESSAGE_NEWTRACKINFORMATION)) {
+                Log.v(TAG, "Received new information");
+                // Extract nowplaying info
+                ArrayList<NowPlayingInformation> infoArray = intent.getExtras().getParcelableArrayList(PlaybackService.INTENT_NOWPLAYINGNAME);
+                if (infoArray.size() != 0) {
+                    NowPlayingInformation info = infoArray.get(0);
+                    mPlayingIndex = info.getPlayingIndex();
+                    updateSelectionInGUI();
+                }
+            }
+        }
+    }
+
+    private class ServiceListener implements PlaybackServiceConnection.ConnectionNotifier {
+
+        @Override
+        public void onConnect() {
+            Log.v(TAG, "Service connected :)");
+            // Set index of current song
+            try {
+                mPlayingIndex = mServiceConnection.getPBS().getCurrentIndex();
+                mPlayListAdapter = new PlaylistTracksAdapter(mServiceConnection.getPBS());
+                mListView.setAdapter(mPlayListAdapter);
+
+                mPlayListAdapter.notifyDataSetChanged();
+                updateSelectionInGUI();
+            } catch (RemoteException e) {
+                e.printStackTrace();
+            }
+        }
+
+        @Override
+        public void onDisconnect() {
+            Log.v(TAG, "Service disconnected :'(");
+        }
+
+    }
+
+    private void openPlaylistNameDialog() {
+
+        PlaylistNameDialogFragment dlg = new PlaylistNameDialogFragment();
+
+        dlg.show(getActivity().getSupportFragmentManager(), "PlaylistNameDialog");
+    }
+
+    public void savePlaylist(String playlistName) {
+
+        // call pbs and save current playlist to mediastore
+        try {
+            mServiceConnection.getPBS().savePlaylist(playlistName);
+        } catch (RemoteException e) {
+            // TODO Auto-generated catch block
+            e.printStackTrace();
+        }
+    }
 }

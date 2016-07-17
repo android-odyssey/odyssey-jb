@@ -1,29 +1,25 @@
 package org.odyssey.fragments;
 
-import org.odyssey.MainActivity;
-import org.odyssey.OdysseyApplication;
 import org.odyssey.R;
 
-import android.app.Activity;
 import android.content.Context;
 import android.os.Bundle;
-import android.os.RemoteException;
 import android.support.v4.app.Fragment;
 import android.support.v4.app.FragmentManager;
 import android.support.v4.app.FragmentPagerAdapter;
+import android.support.v4.view.PagerTabStrip;
 import android.support.v4.view.ViewPager;
 import android.view.LayoutInflater;
-import android.view.Menu;
-import android.view.MenuInflater;
-import android.view.MenuItem;
 import android.view.View;
 import android.view.ViewGroup;
-import android.widget.Toast;
 
 public class ArtistsAlbumsTabsFragment extends Fragment {
 
     ViewPager mViewPager;
     AppSectionsPagerAdapter mAppSectionsPagerAdapter;
+
+    private ArtistsSectionFragment mArtistsFragment;
+    private AlbumsSectionFragment mAlbumsFragment;
 
     // Listener for communication via container activity
     public interface OnAboutSelectedListener {
@@ -43,9 +39,12 @@ public class ArtistsAlbumsTabsFragment extends Fragment {
         super.onCreateView(inflater, container, savedInstanceState);
 
         // indicate this fragment has its own menu
-//        setHasOptionsMenu(true);
+        // setHasOptionsMenu(true);
 
         View rootView = inflater.inflate(R.layout.fragment_artists_albums_tabs, container, false);
+
+        // Set actionbar title
+        getActivity().getActionBar().setTitle(R.string.app_name);
 
         // Create the adapter that will return a fragment for each of the three
         // primary sections
@@ -60,15 +59,22 @@ public class ArtistsAlbumsTabsFragment extends Fragment {
 
         // set start page to albumsection
         mViewPager.setCurrentItem(1);
+        ((PagerTabStrip) rootView.findViewById(R.id.pager_tab_strip)).setTabIndicatorColor(getResources().getColor(android.R.color.holo_blue_dark));
 
         return rootView;
+    }
+
+    @Override
+    public void onResume() {
+        super.onResume();
+        mAppSectionsPagerAdapter = new AppSectionsPagerAdapter(getChildFragmentManager(), getActivity());
     }
 
     /**
      * A {@link FragmentPagerAdapter} that returns a fragment corresponding to
      * one of the primary sections of the app.
      */
-    public static class AppSectionsPagerAdapter extends FragmentPagerAdapter {
+    public class AppSectionsPagerAdapter extends FragmentPagerAdapter {
         Context mContext;
         static final int mNumberOfPages = 3;
 
@@ -81,9 +87,15 @@ public class ArtistsAlbumsTabsFragment extends Fragment {
         public Fragment getItem(int i) {
             switch (i) {
             case 0:
-                return new ArtistsSectionFragment();
+                if (mArtistsFragment == null) {
+                    mArtistsFragment = new ArtistsSectionFragment();
+                    return mArtistsFragment;
+                }
             case 1:
-                return new AlbumsSectionFragment();
+                if (mAlbumsFragment == null) {
+                    mAlbumsFragment = new AlbumsSectionFragment();
+                    return mAlbumsFragment;
+                }
             case 2:
                 return new AllTracksFragment();
             default:

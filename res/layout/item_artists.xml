@@ -1,26 +1,62 @@
 <?xml version="1.0" encoding="utf-8"?>
-<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
-    android:layout_width="match_parent"
-    android:layout_height="wrap_content" 
-    android:gravity="center_horizontal"
-    android:orientation="vertical">
+<RelativeLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="0dp"
+    android:layout_height="0dp" >
 
-    <ImageView
-        android:id="@+id/imageViewArtists"
+    <ViewSwitcher
+        android:id="@+id/albumgridSwitcher"
         android:layout_width="match_parent"
-        android:layout_height="@dimen/album_cover_height"
-        android:layout_weight="1.0"
-    />
+        android:layout_height="match_parent"
+        android:layout_alignParentBottom="true"
+        android:outAnimation="@animator/fadeout" 
+        android:inAnimation="@animator/fadein"
+        android:animateFirstView="true">
 
-    <TextView
-        android:id="@+id/textViewArtistsItem"
-        android:layout_width="wrap_content"
-        android:layout_height="wrap_content"
-        android:layout_weight="1.0"
-        android:maxLines="1" 
-        android:singleLine="true"
-        android:ellipsize="marquee"
-        android:fadingEdgeLength="16sp"
-    />
+        <ImageView
+            android:id="@+id/imageViewAlbumPlaceholder"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:scaleType="centerCrop"
+            android:src="@drawable/coverplaceholder" />
 
-</LinearLayout>
+        <ImageView
+            android:id="@+id/imageViewArtists"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:scaleType="centerCrop" />
+    </ViewSwitcher>
+
+    <View
+        android:layout_width="fill_parent"
+        android:layout_height="fill_parent"
+        android:layout_alignParentBottom="true"
+        android:background="?android:selectableItemBackground"
+        android:clickable="false" />
+
+    <RelativeLayout
+        android:layout_width="match_parent"
+        android:layout_height="48dp"
+        android:layout_alignParentBottom="true" >
+
+        <View
+            android:layout_width="fill_parent"
+            android:layout_height="fill_parent"
+            android:layout_alignParentBottom="true"
+            android:background="@drawable/gridgradient" />
+
+        <TextView
+            android:id="@+id/textViewArtistsItem"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:layout_margin="4dp"
+            android:ellipsize="marquee"
+            android:fadingEdgeLength="16sp"
+            android:fontFamily="sans-serif-light"
+            android:gravity="center_vertical|center_horizontal"
+            android:maxLines="1"
+            android:singleLine="true"
+            android:textColor="@android:color/primary_text_dark"
+            android:textSize="14sp" />
+    </RelativeLayout>
+
+</RelativeLayout>

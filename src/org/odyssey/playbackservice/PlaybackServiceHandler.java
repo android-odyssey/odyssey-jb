@@ -1,7 +1,9 @@
 package org.odyssey.playbackservice;
 
 import java.lang.ref.WeakReference;
+import java.util.concurrent.Semaphore;
 
+import android.content.MutableContextWrapper;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.Message;
@@ -12,11 +14,14 @@ public class PlaybackServiceHandler extends Handler {
 
     private final WeakReference<PlaybackService> mService;
 
+    private Semaphore mLock;
+
     public PlaybackServiceHandler(Looper looper, PlaybackService service) {
         super(looper);
         Log.v(TAG, "Handler created");
         mService = new WeakReference<PlaybackService>(service);
         Log.v(TAG, "MyPid: " + android.os.Process.myPid() + " MyTid: " + android.os.Process.myTid());
+        mLock = new Semaphore(1);
     }
 
     @Override
@@ -28,7 +33,8 @@ public class PlaybackServiceHandler extends Handler {
         ControlObject msgObj = (ControlObject) msg.obj;
 
         // Check if object is received
-        if (msgObj != null) {
+        if (msgObj != null && mLock.tryAcquire()) {
+            Log.v(TAG, "Start control command");
             // Parse message
             if (msgObj.getAction() == ControlObject.PLAYBACK_ACTION.ODYSSEY_PLAY) {
                 mService.get().playURI(msgObj.getTrack());
@@ -51,7 +57,7 @@ public class PlaybackServiceHandler extends Handler {
             } else if (msgObj.getAction() == ControlObject.PLAYBACK_ACTION.ODYSSEY_SEEKTO) {
                 mService.get().seekTo(msgObj.getIntParam());
             } else if (msgObj.getAction() == ControlObject.PLAYBACK_ACTION.ODYSSEY_JUMPTO) {
-                mService.get().jumpToIndex(msgObj.getIntParam(),true);
+                mService.get().jumpToIndex(msgObj.getIntParam(), true);
             } else if (msgObj.getAction() == ControlObject.PLAYBACK_ACTION.ODYSSEY_DEQUEUETRACK) {
 
             } else if (msgObj.getAction() == ControlObject.PLAYBACK_ACTION.ODYSSEY_DEQUEUEINDEX) {
@@ -72,8 +78,13 @@ public class PlaybackServiceHandler extends Handler {
                 mService.get().shufflePlaylist();
             } else if (msgObj.getAction() == ControlObject.PLAYBACK_ACTION.ODYSSEY_PLAYALLTRACKS) {
                 mService.get().playAllTracks();
+            } else if (msgObj.getAction() == ControlObject.PLAYBACK_ACTION.ODYSSEY_PLAYALLTRACKSSHUFFLED) {
+                mService.get().playAllTracksShuffled();
+            } else if (msgObj.getAction() == ControlObject.PLAYBACK_ACTION.ODYSSEY_SAVEPLAYLIST) {
+                mService.get().savePlaylist(msgObj.getStringParam());
             }
-
+            mLock.release();
+            Log.v(TAG, "End control command");
         }
 
     }

@@ -1,21 +1,20 @@
 package org.odyssey.fragments;
 
 import java.util.ArrayList;
+import java.util.HashMap;
 
 import org.odyssey.MainActivity;
 import org.odyssey.MusicLibraryHelper;
-import org.odyssey.OdysseyApplication;
 import org.odyssey.R;
 import org.odyssey.fragments.ArtistsAlbumsTabsFragment.OnAboutSelectedListener;
 import org.odyssey.fragments.ArtistsAlbumsTabsFragment.OnPlayAllSelectedListener;
 import org.odyssey.fragments.ArtistsAlbumsTabsFragment.OnSettingsSelectedListener;
-import org.odyssey.fragments.ArtistsSectionFragment.OnArtistSelectedListener;
+import org.odyssey.playbackservice.PlaybackServiceConnection;
 import org.odyssey.playbackservice.TrackItem;
 
 import android.app.Activity;
 import android.content.Context;
 import android.database.Cursor;
-import android.graphics.Bitmap;
 import android.os.Bundle;
 import android.os.RemoteException;
 import android.provider.MediaStore;
@@ -23,24 +22,25 @@ import android.support.v4.app.Fragment;
 import android.support.v4.app.LoaderManager;
 import android.support.v4.content.CursorLoader;
 import android.support.v4.content.Loader;
-import android.support.v4.widget.CursorAdapter;
-import android.util.Log;
 import android.view.ContextMenu;
+import android.view.ContextMenu.ContextMenuInfo;
+import android.view.Gravity;
 import android.view.LayoutInflater;
 import android.view.Menu;
 import android.view.MenuInflater;
 import android.view.MenuItem;
 import android.view.View;
 import android.view.ViewGroup;
-import android.view.ContextMenu.ContextMenuInfo;
+import android.view.ViewGroup.LayoutParams;
 import android.widget.AdapterView;
-import android.widget.BaseAdapter;
-import android.widget.ImageView;
-import android.widget.ListView;
-import android.widget.SectionIndexer;
-import android.widget.TextView;
 import android.widget.AdapterView.AdapterContextMenuInfo;
 import android.widget.AdapterView.OnItemClickListener;
+import android.widget.BaseAdapter;
+import android.widget.LinearLayout;
+import android.widget.ListView;
+import android.widget.ProgressBar;
+import android.widget.SectionIndexer;
+import android.widget.TextView;
 
 public class AllTracksFragment extends Fragment implements LoaderManager.LoaderCallbacks<Cursor>, OnItemClickListener {
 
@@ -51,6 +51,8 @@ public class AllTracksFragment extends Fragment implements LoaderManager.LoaderC
     OnAboutSelectedListener mAboutSelectedCallback;
     OnSettingsSelectedListener mSettingsSelectedCallback;
     OnPlayAllSelectedListener mPlayAllSelectedCallback;
+
+    private PlaybackServiceConnection mServiceConnection;
 
     public void onAttach(Activity activity) {
         super.onAttach(activity);
@@ -95,6 +97,9 @@ public class AllTracksFragment extends Fragment implements LoaderManager.LoaderC
         mListView.setAdapter(mCursorAdapter);
 
         mListView.setOnItemClickListener((OnItemClickListener) this);
+        
+        // Add progressbar for notification of ongoing action
+        mListView.setEmptyView(rootView.findViewById(R.id.alltracksProgressbar));
 
         // register context menu
         registerForContextMenu(mListView);
@@ -138,7 +143,8 @@ public class AllTracksFragment extends Fragment implements LoaderManager.LoaderC
     @Override
     public void onResume() {
         super.onResume();
-        // TODO
+        mServiceConnection = new PlaybackServiceConnection(getActivity().getApplicationContext());
+        mServiceConnection.openConnection();
     }
 
     private class AllTracksCursorAdapter extends BaseAdapter implements SectionIndexer {
@@ -147,6 +153,7 @@ public class AllTracksFragment extends Fragment implements LoaderManager.LoaderC
         private Cursor mCursor;
         ArrayList<String> mSectionList;
         ArrayList<Integer> mSectionPositions;
+        HashMap<Character, Integer> mPositionSectionMap;
 
         public AllTracksCursorAdapter(Context context, Cursor c, int flags) {
 
@@ -155,6 +162,8 @@ public class AllTracksFragment extends Fragment implements LoaderManager.LoaderC
             mInflater = LayoutInflater.from(context);
             mCursor = c;
             mSectionList = new ArrayList<String>();
+            mSectionPositions = new ArrayList<Integer>();
+            mPositionSectionMap = new HashMap<Character, Integer>();
         }
 
         @Override
@@ -173,13 +182,9 @@ public class AllTracksFragment extends Fragment implements LoaderManager.LoaderC
             String trackName = this.mCursor.getString(this.mCursor.getColumnIndex(MediaStore.Audio.Media.TITLE));
 
             char trackSection = trackName.toUpperCase().charAt(0);
-
-            for (int i = 0; i < mSectionList.size(); i++) {
-
-                if (trackSection == mSectionList.get(i).toUpperCase().charAt(0)) {
-                    return i;
-                }
-
+            if (mPositionSectionMap.containsKey(trackSection)) {
+                int sectionIndex = mPositionSectionMap.get(trackSection);
+                return sectionIndex;
             }
 
             return 0;
@@ -289,8 +294,9 @@ public class AllTracksFragment extends Fragment implements LoaderManager.LoaderC
 
             // create sectionlist for fastscrolling
 
-            mSectionList = new ArrayList<String>();
-            mSectionPositions = new ArrayList<Integer>();
+            mSectionList.clear();
+            mSectionPositions.clear();
+            mPositionSectionMap.clear();
 
             this.mCursor.moveToPosition(0);
 
@@ -303,6 +309,7 @@ public class AllTracksFragment extends Fragment implements LoaderManager.LoaderC
 
             mSectionList.add("" + lastSection);
             mSectionPositions.add(0);
+            mPositionSectionMap.put(lastSection, mSectionList.size() - 1);
 
             for (int i = 1; i < this.mCursor.getCount(); i++) {
 
@@ -315,6 +322,8 @@ public class AllTracksFragment extends Fragment implements LoaderManager.LoaderC
 
                     lastSection = currentSection;
                     mSectionPositions.add(i);
+                    mPositionSectionMap.put(currentSection, mSectionList.size() - 1);
+
                 }
 
             }
@@ -329,12 +338,11 @@ public class AllTracksFragment extends Fragment implements LoaderManager.LoaderC
 
     private void playTrack(int position) {
         // clear playlist and play current track
-        OdysseyApplication app = (OdysseyApplication) getActivity().getApplication();
 
         try {
-            app.getPlaybackService().clearPlaylist();
+            mServiceConnection.getPBS().clearPlaylist();
             enqueueTrack(position);
-            app.getPlaybackService().jumpTo(0);
+            mServiceConnection.getPBS().jumpTo(0);
         } catch (RemoteException e1) {
             // TODO Auto-generated catch block
             e1.printStackTrace();
@@ -343,10 +351,9 @@ public class AllTracksFragment extends Fragment implements LoaderManager.LoaderC
 
     private void enqueueTrack(int position) {
         // Enqueue single track
-        OdysseyApplication app = (OdysseyApplication) getActivity().getApplication();
 
         try {
-            app.getPlaybackService().enqueueTrack((TrackItem) mCursorAdapter.getItem(position));
+            mServiceConnection.getPBS().enqueueTrack((TrackItem) mCursorAdapter.getItem(position));
         } catch (RemoteException e) {
             // TODO Auto-generated catch block
             e.printStackTrace();
@@ -355,10 +362,9 @@ public class AllTracksFragment extends Fragment implements LoaderManager.LoaderC
 
     private void enqueueTrackAsNext(int position) {
         // Enqueue single track
-        OdysseyApplication app = (OdysseyApplication) getActivity().getApplication();
 
         try {
-            app.getPlaybackService().enqueueTrackAsNext((TrackItem) mCursorAdapter.getItem(position));
+            mServiceConnection.getPBS().enqueueTrackAsNext((TrackItem) mCursorAdapter.getItem(position));
         } catch (RemoteException e) {
             // TODO Auto-generated catch block
             e.printStackTrace();

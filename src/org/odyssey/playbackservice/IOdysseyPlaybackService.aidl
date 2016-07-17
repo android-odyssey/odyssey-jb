@@ -1,6 +1,5 @@
 package org.odyssey.playbackservice;
 
-import org.odyssey.IOdysseyNowPlayingCallback;
 import org.odyssey.playbackservice.TrackItem;
 
 interface IOdysseyPlaybackService {
@@ -15,6 +14,7 @@ interface IOdysseyPlaybackService {
 	void togglePause();
 	void shufflePlaylist();
 	void playAllTracks();
+	void playAllTracksShuffled();
 	
 	/**
 	 * position = position in current track ( in seconds)
@@ -26,6 +26,9 @@ interface IOdysseyPlaybackService {
 	
 	// If currently playing return this song otherwise null
 	TrackItem getCurrentSong();
+	
+	// save current playlist in mediastore
+	void savePlaylist(String name);
 	
 	// return the current index
 	int getCurrentIndex();
@@ -43,6 +46,7 @@ interface IOdysseyPlaybackService {
 	
 	int getRandom();
 	int getRepeat();
+	int getPlaying();
 	
 	// track is the full uri with "file://" !
 	void setNextTrack(String track);
@@ -63,10 +67,4 @@ interface IOdysseyPlaybackService {
 	String getAlbum();
 	String getTrackname();
 	int getTrackNo();
-	int getBitrate();
-	int getSamplerate();
-	
-	
-	void registerNowPlayingReceiver(IOdysseyNowPlayingCallback receiver);
-	void unregisterNowPlayingReceiver(IOdysseyNowPlayingCallback receiver);
 }

@@ -4,9 +4,9 @@ import java.util.ArrayList;
 
 import org.odyssey.MainActivity;
 import org.odyssey.MusicLibraryHelper;
-import org.odyssey.OdysseyApplication;
 import org.odyssey.R;
 import org.odyssey.fragments.ArtistsSectionFragment.OnArtistSelectedListener;
+import org.odyssey.playbackservice.PlaybackServiceConnection;
 import org.odyssey.playbackservice.TrackItem;
 
 import android.app.ActionBar;
@@ -59,6 +59,8 @@ public class AlbumsTracksFragment extends Fragment {
 
     // FIXME listener in new file?
     OnArtistSelectedListener mArtistSelectedCallback;
+
+    private PlaybackServiceConnection mServiceConnection;
 
     public void onAttach(Activity activity) {
         super.onAttach(activity);
@@ -126,6 +128,9 @@ public class AlbumsTracksFragment extends Fragment {
         mAlbumCoverPath = args.getString(ARG_ALBUMART);
         mAlbumArtist = args.getString(ARG_ALBUMARTIST);
 
+        // Set actionbar title
+        getActivity().getActionBar().setTitle(mAlbumTitle);
+
         setAlbumInformation();
 
         setAlbumTracks();
@@ -140,6 +145,13 @@ public class AlbumsTracksFragment extends Fragment {
     public void onStart() {
         super.onStart();
 
+    }
+
+    @Override
+    public void onResume() {
+        super.onResume();
+        mServiceConnection = new PlaybackServiceConnection(getActivity().getApplicationContext());
+        mServiceConnection.openConnection();
     }
 
     private void setAlbumInformation() {
@@ -161,8 +173,6 @@ public class AlbumsTracksFragment extends Fragment {
 
         Cursor cursor = getActivity().getContentResolver().query(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, MusicLibraryHelper.projectionTracks, where, whereVal, orderBy);
 
-        boolean isSampler = false;
-
         ArrayList<TrackItem> trackList = new ArrayList<TrackItem>();
 
         // get all tracks on the current album
@@ -176,18 +186,12 @@ public class AlbumsTracksFragment extends Fragment {
                 String url = cursor.getString(cursor.getColumnIndex(MediaStore.Audio.Media.DATA));
 
                 TrackItem item = new TrackItem(title, artist, album, url, no, duration, mAlbumKey);
-                if (!item.getTrackArtist().equals(mAlbumArtist)) {
 
-                    // trackartist not albumartist -> sampler
-                    isSampler = true;
-                }
                 trackList.add(item);
             } while (cursor.moveToNext());
         }
 
         cursor.close();
-
-        mTrackListAdapter.setIsSampler(isSampler);
 
         mTrackListAdapter.addAll(trackList);
     }
@@ -219,7 +223,6 @@ public class AlbumsTracksFragment extends Fragment {
         private Context mContext;
         private LayoutInflater mInflater;
         private int mLayoutResourceId;
-        private boolean mIsSampler;
 
         public TrackListArrayAdapter(Context context, int layoutResourceId, ArrayList<TrackItem> data) {
             super(context, layoutResourceId, data);
@@ -227,8 +230,6 @@ public class AlbumsTracksFragment extends Fragment {
             mContext = context;
             mLayoutResourceId = layoutResourceId;
             mInflater = LayoutInflater.from(context);
-            mIsSampler = false;
-
         }
 
         @Override
@@ -276,25 +277,16 @@ public class AlbumsTracksFragment extends Fragment {
                 trackNumberView.setText(trackNumber);
             }
 
-            // set artist if sampler
-            if (mIsSampler) {
-                trackArtistView.setText(trackItem.getTrackArtist());
-            }
+            // set artist
+            trackArtistView.setText(trackItem.getTrackArtist());
 
             return convertView;
 
         }
-
-        public void setIsSampler(boolean sampler) {
-            mIsSampler = sampler;
-        }
-
     }
 
     private void playAlbum(int position) {
         // clear playlist and play current album
-        OdysseyApplication app = (OdysseyApplication) getActivity().getApplication();
-
         int index = position;
 
         // respect head element
@@ -303,9 +295,9 @@ public class AlbumsTracksFragment extends Fragment {
         }
 
         try {
-            app.getPlaybackService().clearPlaylist();
+            mServiceConnection.getPBS().clearPlaylist();
             enqueueAlbum();
-            app.getPlaybackService().jumpTo(index);
+            mServiceConnection.getPBS().jumpTo(index);
         } catch (RemoteException e1) {
             // TODO Auto-generated catch block
             e1.printStackTrace();
@@ -314,12 +306,11 @@ public class AlbumsTracksFragment extends Fragment {
 
     private void enqueueAlbum() {
         // Enqueue complete album
-        OdysseyApplication app = (OdysseyApplication) getActivity().getApplication();
 
         // enqueue albumtracks
         for (int i = 0; i < mTrackListAdapter.getCount(); i++) {
             try {
-                app.getPlaybackService().enqueueTrack(mTrackListAdapter.getItem(i));
+                mServiceConnection.getPBS().enqueueTrack(mTrackListAdapter.getItem(i));
             } catch (RemoteException e) {
                 // TODO Auto-generated catch block
                 e.printStackTrace();
@@ -329,10 +320,9 @@ public class AlbumsTracksFragment extends Fragment {
 
     private void enqueueTrack(int position) {
         // Enqueue single track
-        OdysseyApplication app = (OdysseyApplication) getActivity().getApplication();
 
         try {
-            app.getPlaybackService().enqueueTrack(mTrackListAdapter.getItem(position));
+            mServiceConnection.getPBS().enqueueTrack(mTrackListAdapter.getItem(position));
         } catch (RemoteException e) {
             // TODO Auto-generated catch block
             e.printStackTrace();
@@ -341,10 +331,9 @@ public class AlbumsTracksFragment extends Fragment {
 
     private void enqueueTrackAsNext(int position) {
         // Enqueue single track
-        OdysseyApplication app = (OdysseyApplication) getActivity().getApplication();
 
         try {
-            app.getPlaybackService().enqueueTrackAsNext(mTrackListAdapter.getItem(position));
+            mServiceConnection.getPBS().enqueueTrackAsNext(mTrackListAdapter.getItem(position));
         } catch (RemoteException e) {
             // TODO Auto-generated catch block
             e.printStackTrace();
